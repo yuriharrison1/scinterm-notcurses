@@ -1,42 +1,63 @@
-#include <scinterm_notcurses.h>
-#include <notcurses/notcurses.h>
+/**
+ * @file quick_start.c
+ * @brief Quick start example for Scinterm NotCurses
+ * Copyright 2012-2026 Mitchell. See LICENSE.
+ */
 
-// Notification callback
-void callback(void *sci, int iMessage, SCNotification *n, void *userdata) {
-    // Handle Scintilla notifications
+#include "scinterm_notcurses.h"
+#include <notcurses/notcurses.h>
+#include <stdbool.h>
+
+/* Notification callback */
+static void callback(void *sci, int iMessage, SCNotification *n, void *userdata) {
+    (void)sci; (void)iMessage; (void)n; (void)userdata;
+    /* Handle Scintilla notifications */
 }
 
-int main() {
-    // Initialize NotCurses
-    scintilla_notcurses_init();
-    struct notcurses *nc = notcurses_get();
-    
-    // Create editor
+int main(void) {
+    /* Initialize NotCurses */
+    if (!scintilla_notcurses_init()) return 1;
+
+    /* Create editor */
     void *editor = scintilla_new(callback, NULL);
-    
-    // Set initial text
-    scintilla_send_message(editor, SCI_SETTEXT, 0, 
+    if (!editor) {
+        scintilla_notcurses_shutdown();
+        return 1;
+    }
+
+    /* Set initial text */
+    scintilla_send_message(editor, SCI_SETTEXT, 0,
         (sptr_t)"Hello, Scinterm World!\n");
-    
-    // Main loop
+
+    /* Get nc from the editor plane */
+    struct ncplane *plane = scintilla_get_plane(editor);
+    struct notcurses *nc = ncplane_notcurses(plane);
+
+    scintilla_set_focus(editor, true);
+
+    /* Main loop */
     bool running = true;
     while (running) {
         scintilla_render(editor);
         notcurses_render(nc);
-        
-        ncinput input;
+
+        ncinput input = {};
         uint32_t key = notcurses_get_blocking(nc, &input);
-        
+        if (key == (uint32_t)-1) break;
+
         if (key == NCKEY_ESC) {
             running = false;
+        } else if (key == NCKEY_RESIZE) {
+            notcurses_refresh(nc, NULL, NULL);
+            scintilla_resize(editor);
         } else {
-            scintilla_process_input(editor, nc);
+            scintilla_send_key(editor, (int)key, (int)input.modifiers);
         }
     }
-    
-    // Cleanup
+
+    /* Cleanup */
     scintilla_delete(editor);
     scintilla_notcurses_shutdown();
-    
+
     return 0;
 }
