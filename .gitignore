@@ -1,0 +1,53 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+CMakeUserPresets.json
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.cproject
+
+# Compiled files
+*.o
+*.so
+*.a
+*.dylib
+*.dll
+*.exe
+*.obj
+*.lib
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+*.tmp
+
+# Test outputs
+Testing/
+test_output/
+
+# Backup files
+*.bak
+*.old
+
+# Coverage
+*.gcov
+*.gcda
+*.gcno
+*.info
+coverage/
+
+# Documentation
+docs/html/
+docs/latex/

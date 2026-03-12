@@ -1,0 +1,299 @@
+# CMakeLists.txt for Scinterm NotCurses
+# Scintilla-based text editor widget for NotCurses terminal environment
+# Copyright 2012-2026 Mitchell. See LICENSE.
+
+cmake_minimum_required(VERSION 3.10)
+project(scinterm_notcurses VERSION 1.0.0 LANGUAGES C CXX)
+
+# ============================================================================
+# Project configuration
+# ============================================================================
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# ============================================================================
+# Build options
+# ============================================================================
+
+option(BUILD_SHARED_LIBS "Build shared libraries" ON)
+option(BUILD_EXAMPLES "Build example programs" ON)
+option(ENABLE_DEBUG "Enable debug output and assertions" OFF)
+option(ENABLE_LEXERS "Enable lexers for syntax highlighting" OFF)
+option(BUILD_TESTING "Build tests" OFF)
+
+# ============================================================================
+# Target names
+# ============================================================================
+
+set(TARGET_NAME scinterm_notcurses)
+set(TARGET_STATIC_NAME scinterm_notcurses_static)
+
+# ============================================================================
+# Find required packages
+# ============================================================================
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(NOTCURSES REQUIRED notcurses>=3.0.0)
+
+# ============================================================================
+# Include directories
+# ============================================================================
+
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/plat
+    ${NOTCURSES_INCLUDE_DIRS}
+)
+
+# ============================================================================
+# Scintilla core sources
+# ============================================================================
+
+set(SCINTILLA_SOURCES
+    src/AutoComplete.cpp
+    src/CallTip.cpp
+    src/CaseConvert.cpp
+    src/CaseFolder.cpp
+    src/Catalogue.cpp
+    src/CellBuffer.cpp
+    src/CharClassify.cpp
+    src/ContractionState.cpp
+    src/Decoration.cpp
+    src/Document.cpp
+    src/EditModel.cpp
+    src/Editor.cpp
+    src/EditView.cpp
+    src/ExternalLexer.cpp
+    src/Indicator.cpp
+    src/KeyMap.cpp
+    src/LineMarker.cpp
+    src/MarginView.cpp
+    src/PerLine.cpp
+    src/PositionCache.cpp
+    src/RunStyles.cpp
+    src/ScintillaBase.cpp
+    src/Selection.cpp
+    src/Style.cpp
+    src/UniConversion.cpp
+    src/ViewStyle.cpp
+    src/XPM.cpp
+)
+
+# ============================================================================
+# Optional lexers for syntax highlighting
+# ============================================================================
+
+if(ENABLE_LEXERS)
+    file(GLOB LEXER_SOURCES "lexers/*.cpp")
+    set(SCINTILLA_SOURCES ${SCINTILLA_SOURCES} ${LEXER_SOURCES})
+endif()
+
+# ============================================================================
+# Platform-specific sources for NotCurses
+# ============================================================================
+
+set(PLATFORM_SOURCES
+    src/plat/scinterm_plat.c
+    src/plat/scinterm_notcurses.cpp
+    src/plat/scinterm_wcwidth.c
+)
+
+set(ALL_SOURCES
+    ${SCINTILLA_SOURCES}
+    ${PLATFORM_SOURCES}
+)
+
+# ============================================================================
+# Public headers
+# ============================================================================
+
+set(PUBLIC_HEADERS
+    include/Scintilla.h
+    include/ScintillaTypes.h
+    include/ScintillaMessages.h
+    include/ScintillaStructures.h
+    include/ILoader.h
+    include/ILexer.h
+    include/scinterm_notcurses.h
+    include/Platform.h
+)
+
+set(PRIVATE_HEADERS
+    src/plat/scinterm_plat.h
+    src/plat/scinterm_wcwidth.h
+)
+
+# ============================================================================
+# Compiler flags
+# ============================================================================
+
+if(ENABLE_DEBUG)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DDEBUG -g -O0 -Wall -Wextra")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DDEBUG -g -O0 -Wall -Wextra")
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNDEBUG -O2 -Wall -Wextra")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DNDEBUG -O2 -Wall -Wextra")
+endif()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${NOTCURSES_CFLAGS_OTHER}")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${NOTCURSES_CFLAGS_OTHER}")
+
+if(WIN32)
+    add_definitions(-D_WIN32 -D_UNICODE -DUNICODE)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DWIN32_LEAN_AND_MEAN")
+elseif(UNIX AND NOT APPLE)
+    add_definitions(-D_GNU_SOURCE)
+endif()
+
+# ============================================================================
+# Build shared library
+# ============================================================================
+
+if(BUILD_SHARED_LIBS)
+    add_library(${TARGET_NAME} SHARED ${ALL_SOURCES} ${PUBLIC_HEADERS} ${PRIVATE_HEADERS})
+    
+    target_link_libraries(${TARGET_NAME}
+        ${NOTCURSES_LIBRARIES}
+        m
+        pthread
+    )
+    
+    set_target_properties(${TARGET_NAME} PROPERTIES
+        VERSION ${PROJECT_VERSION}
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+        OUTPUT_NAME scinterm_notcurses
+        PUBLIC_HEADER "${PUBLIC_HEADERS}"
+    )
+    
+    install(TARGETS ${TARGET_NAME}
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        PUBLIC_HEADER DESTINATION include/scinterm
+    )
+endif()
+
+# ============================================================================
+# Build static library
+# ============================================================================
+
+add_library(${TARGET_STATIC_NAME} STATIC ${ALL_SOURCES})
+
+target_link_libraries(${TARGET_STATIC_NAME}
+    ${NOTCURSES_LIBRARIES}
+    m
+    pthread
+)
+
+set_target_properties(${TARGET_STATIC_NAME} PROPERTIES
+    OUTPUT_NAME scinterm_notcurses_static
+)
+
+install(TARGETS ${TARGET_STATIC_NAME}
+    ARCHIVE DESTINATION lib
+)
+
+install(FILES ${PUBLIC_HEADERS}
+    DESTINATION include/scinterm
+)
+
+# ============================================================================
+# Build examples
+# ============================================================================
+
+if(BUILD_EXAMPLES)
+    add_executable(scinterm_example examples/simple_editor.c)
+    target_link_libraries(scinterm_example
+        ${TARGET_NAME}
+        ${NOTCURSES_LIBRARIES}
+        m
+    )
+    set_target_properties(scinterm_example PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    
+    add_executable(scinterm_multi examples/multi_window.c)
+    target_link_libraries(scinterm_multi
+        ${TARGET_NAME}
+        ${NOTCURSES_LIBRARIES}
+        m
+    )
+    set_target_properties(scinterm_multi PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    
+    add_executable(scinterm_syntax examples/syntax_highlighting.c)
+    target_link_libraries(scinterm_syntax
+        ${TARGET_NAME}
+        ${NOTCURSES_LIBRARIES}
+        m
+    )
+    set_target_properties(scinterm_syntax PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    
+    install(TARGETS scinterm_example scinterm_multi scinterm_syntax
+        RUNTIME DESTINATION bin
+    )
+endif()
+
+# ============================================================================
+# Build tests
+# ============================================================================
+
+if(BUILD_TESTING)
+    enable_testing()
+    
+    add_executable(scinterm_test tests/test_editor.c)
+    target_link_libraries(scinterm_test
+        ${TARGET_NAME}
+        ${NOTCURSES_LIBRARIES}
+        m
+    )
+    add_test(NAME scinterm_test COMMAND scinterm_test)
+endif()
+
+# ============================================================================
+# Generate package configuration
+# ============================================================================
+
+include(CMakePackageConfigHelpers)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/scinterm_notcurses-config-version.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+configure_package_config_file(
+    "cmake/scinterm_notcurses-config.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/scinterm_notcurses-config.cmake"
+    INSTALL_DESTINATION lib/cmake/scinterm_notcurses
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/scinterm_notcurses-config.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/scinterm_notcurses-config-version.cmake"
+    DESTINATION lib/cmake/scinterm_notcurses
+)
+
+# ============================================================================
+# Build summary
+# ============================================================================
+
+message(STATUS "========================================")
+message(STATUS "Scinterm NotCurses Build Configuration")
+message(STATUS "========================================")
+message(STATUS "Project Version: ${PROJECT_VERSION}")
+message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "Install Prefix: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "Build Shared Library: ${BUILD_SHARED_LIBS}")
+message(STATUS "Build Examples: ${BUILD_EXAMPLES}")
+message(STATUS "Enable Lexers: ${ENABLE_LEXERS}")
+message(STATUS "Debug Mode: ${ENABLE_DEBUG}")
+message(STATUS "NotCurses Version: ${NOTCURSES_VERSION}")
+message(STATUS "========================================")

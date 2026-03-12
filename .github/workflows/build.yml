@@ -1,0 +1,371 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [fedora:43, ubuntu-latest, macos-latest]
+        build_type: [Debug, Release]
+        exclude:
+          # Fedora só roda nativamente em Linux
+          - os: fedora:43
+            runner: ubuntu-latest
+        include:
+          - os: fedora:43
+            runner: ubuntu-latest
+            container: fedora:43
+    
+    runs-on: ${{ matrix.runner || matrix.os }}
+    container: ${{ matrix.container }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+    
+    - name: Install dependencies (Fedora 43)
+      if: matrix.os == 'fedora:43'
+      run: |
+        dnf update -y
+        dnf install -y \
+          gcc-c++ \
+          cmake \
+          ninja-build \
+          notcurses-devel \
+          notcurses-static \
+          make \
+          git \
+          pkgconfig \
+          which \
+          findutils \
+          diffutils \
+          file \
+          glibc-static \
+          libstdc++-static
+        
+        # Verificar instalação
+        rpm -q notcurses-devel
+        pkg-config --modversion notcurses
+    
+    - name: Install dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          libnotcurses-dev \
+          cmake \
+          build-essential \
+          ninja-build \
+          pkg-config
+    
+    - name: Install dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew update
+        brew install \
+          notcurses \
+          cmake \
+          ninja \
+          pkg-config
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+          -DBUILD_EXAMPLES=ON \
+          -DBUILD_TESTING=ON \
+          -DENABLE_LEXERS=ON \
+          -DCMAKE_VERBOSE_MAKEFILE=ON
+    
+    - name: Build
+      run: |
+        cmake --build build --config ${{ matrix.build_type }} --parallel $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
+    
+    - name: List build artifacts
+      run: |
+        ls -la build/
+        ls -la build/bin/ || true
+        ls -la build/lib/ || true
+    
+    - name: Test
+      working-directory: build
+      run: |
+        ctest --output-on-failure --verbose -C ${{ matrix.build_type }}
+    
+    - name: Install
+      run: |
+        cmake --install build --prefix install_root --config ${{ matrix.build_type }}
+    
+    - name: Verify installation
+      run: |
+        ls -la install_root/
+        ls -la install_root/include/ || true
+        ls -la install_root/lib/ || true
+        ls -la install_root/bin/ || true
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: scinterm-${{ matrix.os }}-${{ matrix.build_type }}
+        path: |
+          build/lib/*.so*
+          build/lib/*.a
+          build/bin/*
+          install_root/
+        retention-days: 30
+
+  test-examples:
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [fedora:43, ubuntu-latest]
+        exclude:
+          - os: fedora:43
+            runner: ubuntu-latest
+        include:
+          - os: fedora:43
+            runner: ubuntu-latest
+            container: fedora:43
+    
+    runs-on: ${{ matrix.runner || matrix.os }}
+    container: ${{ matrix.container }}
+    
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: scinterm-${{ matrix.os }}-Release
+        path: build/
+    
+    - name: Install dependencies (Fedora 43)
+      if: matrix.os == 'fedora:43'
+      run: |
+        dnf update -y
+        dnf install -y \
+          notcurses-devel \
+          which
+    
+    - name: Install dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          libnotcurses-dev
+    
+    - name: Make binaries executable
+      run: |
+        chmod +x build/bin/* || true
+        ls -la build/bin/
+    
+    - name: Test simple editor
+      run: |
+        build/bin/scinterm_example --version || echo "Example ran with exit code $?"
+      continue-on-error: true
+    
+    - name: Test multi-window
+      run: |
+        build/bin/scinterm_multi --version || echo "Example ran with exit code $?"
+      continue-on-error: true
+
+  coverage:
+    runs-on: fedora:43
+    container: fedora:43
+    if: github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install dependencies with coverage tools
+      run: |
+        dnf update -y
+        dnf install -y \
+          gcc-c++ \
+          cmake \
+          ninja-build \
+          notcurses-devel \
+          gcov \
+          lcov \
+          git \
+          make
+        
+        # Install gcovr
+        pip3 install gcovr
+    
+    - name: Configure with coverage
+      run: |
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DBUILD_EXAMPLES=ON \
+          -DBUILD_TESTING=ON \
+          -DENABLE_LEXERS=ON \
+          -DCMAKE_CXX_FLAGS="--coverage -fprofile-arcs -ftest-coverage" \
+          -DCMAKE_C_FLAGS="--coverage -fprofile-arcs -ftest-coverage"
+    
+    - name: Build with coverage
+      run: |
+        cmake --build build --parallel $(nproc)
+    
+    - name: Run tests for coverage
+      working-directory: build
+      run: |
+        ctest --output-on-failure
+    
+    - name: Generate coverage report
+      run: |
+        lcov --capture --directory . --output-file coverage.info
+        lcov --remove coverage.info '/usr/*' '*/test/*' '*/examples/*' --output-file coverage.info
+        lcov --list coverage.info
+    
+    - name: Upload coverage report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: coverage.info
+
+  release:
+    needs: [build, test-examples]
+    runs-on: fedora:43
+    container: fedora:43
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install packaging tools
+      run: |
+        dnf update -y
+        dnf install -y \
+          gcc-c++ \
+          cmake \
+          ninja-build \
+          notcurses-devel \
+          rpm-build \
+          createrepo \
+          git
+    
+    - name: Build RPM
+      run: |
+        mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+        
+        # Create source tarball
+        git archive --format=tar --prefix=scinterm-${GITHUB_REF_NAME}/ HEAD | gzip > rpmbuild/SOURCES/scinterm-${GITHUB_REF_NAME}.tar.gz
+        
+        # Create RPM spec file
+        cat > rpmbuild/SPECS/scinterm.spec << EOF
+Name:           scinterm
+Version:        ${GITHUB_REF_NAME#v}
+Release:        1%{?dist}
+Summary:        Scintilla-based text editor for NotCurses
+
+License:        MIT
+URL:            https://github.com/${{ github.repository }}
+Source0:        %{name}-%{version}.tar.gz
+
+BuildRequires:  gcc-c++
+BuildRequires:  cmake
+BuildRequires:  notcurses-devel
+BuildRequires:  make
+
+%description
+Scinterm is a port of the Scintilla editing component to the NotCurses
+terminal environment. It provides a full-featured text editor widget
+with syntax highlighting, multiple cursors, auto-completion, and true
+color support.
+
+%package devel
+Summary:        Development files for %{name}
+Requires:       %{name}%{?_isa} = %{version}-%{release}
+
+%description devel
+This package contains the headers and development libraries for %{name}.
+
+%prep
+%setup -q
+
+%build
+%cmake -DBUILD_EXAMPLES=ON -DENABLE_LEXERS=ON
+%cmake_build
+
+%install
+%cmake_install
+
+%files
+%license LICENSE
+%doc README.md
+%{_libdir}/libscinterm_notcurses.so.*
+%{_bindir}/scinterm_example
+%{_bindir}/scinterm_multi
+%{_bindir}/scinterm_syntax
+
+%files devel
+%{_includedir}/scinterm/
+%{_libdir}/libscinterm_notcurses.so
+%{_libdir}/libscinterm_notcurses_static.a
+%{_libdir}/cmake/scinterm_notcurses/
+
+%changelog
+* $(date +"%a %b %d %Y") GitHub Actions <actions@github.com> - ${GITHUB_REF_NAME#v}-1
+- Automatic build from ${GITHUB_SHA}
+EOF
+        
+        # Build RPM
+        rpmbuild -ba --define "_topdir $(pwd)/rpmbuild" rpmbuild/SPECS/scinterm.spec
+    
+    - name: Upload RPM
+      uses: actions/upload-artifact@v4
+      with:
+        name: scinterm-rpm
+        path: rpmbuild/RPMS/**/*.rpm
+    
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          rpmbuild/RPMS/**/*.rpm
+          build/lib/libscinterm_notcurses.so*
+          build/lib/libscinterm_notcurses_static.a
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  fedora-copr:
+    runs-on: fedora:43
+    container: fedora:43
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Submit to COPR
+      env:
+        COPR_API_TOKEN: ${{ secrets.COPR_API_TOKEN }}
+      run: |
+        dnf install -y copr-cli
+        
+        # Create copr config
+        mkdir -p ~/.config
+        cat > ~/.config/copr << EOF
+[copr-cli]
+login = ${COPR_API_TOKEN%:*}
+username = ${{ github.repository_owner }}
+token = ${COPR_API_TOKEN#*:}
+copr_url = https://copr.fedorainfracloud.org
+EOF
+        
+        # Submit build
+        copr-cli build scinterm --nowait https://github.com/${{ github.repository }}/archive/${{ github.sha }}.tar.gz
