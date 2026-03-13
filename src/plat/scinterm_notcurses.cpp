@@ -31,6 +31,10 @@
 
 #include <notcurses/notcurses.h>
 
+#ifdef ENABLE_SCINTILLUA
+#include "Scintillua.h"
+#endif
+
 #include "ScintillaTypes.h"
 #include "ScintillaMessages.h"
 #include "ScintillaStructures.h"
@@ -556,6 +560,22 @@ void scintilla_set_color_offsets(int color_offset, int pair_offset) {
     (void)color_offset;
     (void)pair_offset;
     /* No-op: NotCurses uses direct true color */
+}
+
+bool scintilla_set_lexer(void *sci, const char *name, const char *lexers_dir) {
+#ifdef ENABLE_SCINTILLUA
+    if (!sci || !name) return false;
+    if (lexers_dir)
+        SetLibraryProperty("scintillua.lexers", lexers_dir);
+    Scintilla::ILexer5 *lexer = CreateLexer(name);
+    if (!lexer) return false;
+    scintilla_send_message(sci, SCI_SETILEXER, 0,
+                           reinterpret_cast<sptr_t>(lexer));
+    return true;
+#else
+    (void)sci; (void)name; (void)lexers_dir;
+    return false;
+#endif
 }
 
 } // extern "C"

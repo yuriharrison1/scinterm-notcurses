@@ -23,6 +23,8 @@ option(BUILD_EXAMPLES "Build example programs" ON)
 option(ENABLE_DEBUG "Enable debug output and assertions" OFF)
 option(ENABLE_LEXERS "Enable lexers for syntax highlighting" OFF)
 option(BUILD_TESTING "Build tests" OFF)
+option(ENABLE_SCINTILLUA "Enable Scintillua Lua-based syntax highlighting" OFF)
+set(SCINTILLUA_DIR "" CACHE PATH "Path to compiled Scintillua directory")
 
 # ============================================================================
 # Target names
@@ -144,6 +146,24 @@ set(PRIVATE_HEADERS
 )
 
 # ============================================================================
+# Scintillua (Lua-based syntax highlighting)
+# ============================================================================
+
+if(ENABLE_SCINTILLUA)
+    if(NOT SCINTILLUA_DIR)
+        message(FATAL_ERROR "SCINTILLUA_DIR must be set when ENABLE_SCINTILLUA=ON")
+    endif()
+    if(NOT EXISTS "${SCINTILLUA_DIR}/Scintillua.h")
+        message(FATAL_ERROR "Scintillua.h not found in SCINTILLUA_DIR=${SCINTILLUA_DIR}")
+    endif()
+    message(STATUS "Scintillua: ${SCINTILLUA_DIR}")
+    add_definitions(-DENABLE_SCINTILLUA)
+    include_directories(${SCINTILLUA_DIR})
+    set(SCINTILLUA_LIB "${SCINTILLUA_DIR}/libscintillua.so")
+    set(SCINTILLUA_LEXERS_DIR "${SCINTILLUA_DIR}/lexers")
+endif()
+
+# ============================================================================
 # Compiler flags
 # ============================================================================
 
@@ -194,6 +214,7 @@ if(BUILD_SHARED_LIBS)
         ${NOTCURSES_LIBRARIES}
         m
         pthread
+        $<$<BOOL:${ENABLE_SCINTILLUA}>:${SCINTILLUA_LIB}>
     )
 
     set_target_properties(${TARGET_NAME} PROPERTIES
@@ -232,6 +253,7 @@ target_link_libraries(${TARGET_STATIC_NAME}
     ${NOTCURSES_LIBRARIES}
     m
     pthread
+    $<$<BOOL:${ENABLE_SCINTILLUA}>:${SCINTILLUA_LIB}>
 )
 
 set_target_properties(${TARGET_STATIC_NAME} PROPERTIES
@@ -283,6 +305,10 @@ if(BUILD_EXAMPLES)
         ${NOTCURSES_LIBRARIES}
         m
     )
+    if(ENABLE_SCINTILLUA)
+        target_compile_definitions(scinterm_syntax PRIVATE
+            SCINTILLUA_LEXERS_DIR="${SCINTILLUA_LEXERS_DIR}")
+    endif()
     set_target_properties(scinterm_syntax PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )

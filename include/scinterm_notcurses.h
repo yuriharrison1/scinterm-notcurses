@@ -221,6 +221,24 @@ char *scintilla_get_clipboard(void *sci, int *len);
  */
 void scintilla_set_color_offsets(int color_offset, int pair_offset);
 
+/*=============================================================================
+ * Syntax highlighting via Scintillua
+ *===========================================================================*/
+
+/**
+ * @brief Set a Scintillua Lua-based lexer for syntax highlighting.
+ *
+ * Requires the library to be built with -DENABLE_SCINTILLUA=ON.
+ *
+ * @param sci        Scinterm instance.
+ * @param name       Language name (e.g. "c", "python", "bash"). Must match a
+ *                   .lua file in the lexers directory.
+ * @param lexers_dir Path to the Scintillua lexers/ directory, or NULL to
+ *                   reuse the last path set.
+ * @return true if the lexer was set successfully, false otherwise.
+ */
+bool scintilla_set_lexer(void *sci, const char *name, const char *lexers_dir);
+
 #ifdef __cplusplus
 }
 #endif

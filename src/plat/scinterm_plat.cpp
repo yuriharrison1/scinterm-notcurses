@@ -505,13 +505,16 @@ void Window::Destroy() noexcept {
 PRectangle Window::GetPosition() const {
     if (!wid) return PRectangle(0, 0, 0, 0);
     auto ncp = static_cast<struct ncplane *>(wid);
-    int y = 0, x = 0;
     unsigned rows = 0, cols = 0;
-    ncplane_yx(ncp, &y, &x);
     ncplane_dim_yx(ncp, &rows, &cols);
-    return PRectangle(static_cast<XYPOSITION>(x), static_cast<XYPOSITION>(y),
-                      static_cast<XYPOSITION>(x + static_cast<int>(cols)),
-                      static_cast<XYPOSITION>(y + static_cast<int>(rows)));
+    /* Return plane-LOCAL coordinates (always origin 0,0).
+     * Scintilla uses this rectangle as its drawing coordinate space, and all
+     * Surface calls (FillRectangle, DrawTextNoClip, …) use plane-local coords.
+     * Using screen-absolute coords would offset all drawing on any plane that
+     * is not positioned at (0,0) — e.g. the right pane in a split view. */
+    return PRectangle(0, 0,
+                      static_cast<XYPOSITION>(cols),
+                      static_cast<XYPOSITION>(rows));
 }
 
 void Window::SetPosition(PRectangle rc) {
