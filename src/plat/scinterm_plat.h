@@ -92,6 +92,7 @@ public:
  */
 class SurfaceImpl : public Surface {
     struct ncplane* ncp;
+    bool isOwned;   /**< true if this surface owns ncp (must destroy it) */
     PRectangle clip;
     ColourRGBA pixmapColor;
     bool isIndentGuideHighlight;

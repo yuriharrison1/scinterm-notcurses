@@ -116,18 +116,24 @@ int main(void) {
     struct notcurses *nc = ncplane_notcurses(plane);
 
     notcurses_mice_enable(nc, NCMICE_ALL_EVENTS);
+    notcurses_linesigs_disable(nc);
 
     bool running = true;
     while (running) {
         scintilla_render(editor);
-        notcurses_render(nc);
         scintilla_update_cursor(editor);
+        notcurses_render(nc);
 
         ncinput input = {};
         uint32_t key = notcurses_get_blocking(nc, &input);
         if (key == (uint32_t)-1) break;
 
-        if (key == 'q' && (input.modifiers & NCKEY_MOD_CTRL)) {
+        /* Skip key release events (Kitty protocol sends press+release pairs) */
+        if (input.evtype == NCTYPE_RELEASE) continue;
+
+        /* Ctrl+Q: notcurses delivers Ctrl+letter as uppercase with ctrl=1 */
+        bool ctrl = input.ctrl || (input.modifiers & NCKEY_MOD_CTRL);
+        if (key == 0x11 || ((key == 'q' || key == 'Q') && ctrl)) {
             running = false;
         } else if (key == NCKEY_RESIZE) {
             notcurses_refresh(nc, NULL, NULL);

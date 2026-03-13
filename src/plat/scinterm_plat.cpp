@@ -134,7 +134,7 @@ std::shared_ptr<Font> Font::Allocate(const FontParameters &fp) {
  * SurfaceImpl implementation
  *===========================================================================*/
 
-SurfaceImpl::SurfaceImpl() : ncp(nullptr), pixmapColor(0, 0, 0),
+SurfaceImpl::SurfaceImpl() : ncp(nullptr), isOwned(false), pixmapColor(0, 0, 0),
     isIndentGuideHighlight(false), isCallTip(false) {
 }
 
@@ -160,14 +160,22 @@ void SurfaceImpl::Init(SurfaceID sid, WindowID wid) {
 
 std::unique_ptr<Surface> SurfaceImpl::AllocatePixMap(int width, int height) {
     auto surf = std::make_unique<SurfaceImpl>();
-    if (ncp) {
+    /* Use the stdplane as parent so the pixmap is NOT a child of the editor
+     * plane (avoids it appearing on top of the editor content).
+     * Position it far off-screen so it is never rendered to the terminal. */
+    struct ncplane *parent = GetStdPlane();
+    if (!parent) parent = ncp;
+    if (parent) {
         struct ncplane_options opts = {};
-        opts.y = 0;
-        opts.x = 0;
+        opts.y = -30000;
+        opts.x = -30000;
         opts.rows = static_cast<unsigned>(height > 0 ? height : 1);
         opts.cols = static_cast<unsigned>(width > 0 ? width : 1);
-        struct ncplane *child = ncplane_create(ncp, &opts);
-        surf->ncp = child;
+        struct ncplane *plane = ncplane_create(parent, &opts);
+        if (plane) {
+            surf->ncp = plane;
+            surf->isOwned = true;
+        }
     }
     return surf;
 }
@@ -177,7 +185,11 @@ void SurfaceImpl::SetMode(SurfaceMode mode) {
 }
 
 void SurfaceImpl::Release() noexcept {
+    if (ncp && isOwned) {
+        ncplane_destroy(ncp);
+    }
     ncp = nullptr;
+    isOwned = false;
 }
 
 int SurfaceImpl::SupportsFeature(Scintilla::Supports feature) noexcept {
@@ -278,7 +290,27 @@ void SurfaceImpl::Stadium(PRectangle rc, FillStroke fillStroke, Ends ends) {
 }
 
 void SurfaceImpl::Copy(PRectangle rc, Point from, Surface &surfaceSource) {
-    (void)rc; (void)from; (void)surfaceSource;
+    SurfaceImpl &src = static_cast<SurfaceImpl &>(surfaceSource);
+    if (!ncp || !src.ncp || src.ncp == ncp) return;
+
+    int srcY = static_cast<int>(from.y);
+    int srcX = static_cast<int>(from.x);
+    int dstY = static_cast<int>(std::floor(rc.top));
+    int dstX = static_cast<int>(std::floor(rc.left));
+    int height = static_cast<int>(std::ceil(rc.bottom) - std::floor(rc.top));
+    int width  = static_cast<int>(std::ceil(rc.right)  - std::floor(rc.left));
+
+    for (int row = 0; row < height; row++) {
+        for (int col = 0; col < width; col++) {
+            nccell cell = NCCELL_TRIVIAL_INITIALIZER;
+            if (ncplane_at_yx_cell(src.ncp, srcY + row, srcX + col, &cell) >= 0) {
+                if (ncplane_cursor_move_yx(ncp, dstY + row, dstX + col) == 0) {
+                    ncplane_putc(ncp, &cell);
+                }
+                nccell_release(src.ncp, &cell);
+            }
+        }
+    }
 }
 
 std::unique_ptr<IScreenLineLayout> SurfaceImpl::Layout(const IScreenLine *screenLine) {
@@ -345,7 +377,6 @@ void SurfaceImpl::MeasureWidths(const Font *font_, std::string_view text,
 
     XYPOSITION pos = 0;
     size_t i = 0;
-    size_t idx = 0;
     const char *str = text.data();
     size_t len = text.size();
 
@@ -367,26 +398,38 @@ void SurfaceImpl::MeasureWidths(const Font *font_, std::string_view text,
             ucs = c & 0x07;
             bytes = 4;
         } else {
-            /* Invalid: treat as single-width */
-            bytes = 1;
-            ucs = c;
+            /* Invalid byte: treat as single-width replacement */
+            positions[i] = pos + 1;
+            i++;
+            pos += 1;
+            continue;
         }
 
-        /* Decode continuation bytes */
-        for (int b = 1; b < bytes && (i + b) < len; b++) {
-            ucs = (ucs << 6) | (static_cast<unsigned char>(str[i + b]) & 0x3F);
+        /* Clamp bytes to remaining length to avoid reading past the buffer */
+        if (i + static_cast<size_t>(bytes) > len)
+            bytes = static_cast<int>(len - i);
+
+        /* Decode continuation bytes, validating format */
+        for (int b = 1; b < bytes; b++) {
+            unsigned char cb = static_cast<unsigned char>(str[i + b]);
+            if ((cb & 0xC0) != 0x80) {
+                /* Truncated sequence — treat remaining as single-width */
+                bytes = b;
+                break;
+            }
+            ucs = (ucs << 6) | (cb & 0x3F);
         }
 
         int w = scinterm_wcwidth(ucs);
         if (w < 0) w = 1;  /* treat control chars as 1 column wide */
         pos += static_cast<XYPOSITION>(w);
 
-        /* Assign the cumulative position to all bytes of this codepoint */
-        for (int b = 0; b < bytes && (i + b) < len; b++) {
-            positions[idx + b] = pos;
+        /* Assign the cumulative position to all bytes of this codepoint.
+         * i + b < len is guaranteed because bytes was clamped above. */
+        for (int b = 0; b < bytes; b++) {
+            positions[i + static_cast<size_t>(b)] = pos;
         }
         i += static_cast<size_t>(bytes);
-        idx += static_cast<size_t>(bytes);
     }
 }
 
@@ -420,7 +463,7 @@ XYPOSITION SurfaceImpl::WidthTextUTF8(const Font *font_, std::string_view text) 
 }
 
 XYPOSITION SurfaceImpl::Ascent(const Font *font_) { (void)font_; return 1; }
-XYPOSITION SurfaceImpl::Descent(const Font *font_) { (void)font_; return 1; }
+XYPOSITION SurfaceImpl::Descent(const Font *font_) { (void)font_; return 0; }
 XYPOSITION SurfaceImpl::InternalLeading(const Font *font_) { (void)font_; return 0; }
 XYPOSITION SurfaceImpl::Height(const Font *font_) { (void)font_; return 1; }
 XYPOSITION SurfaceImpl::AverageCharWidth(const Font *font_) { (void)font_; return 1; }
@@ -532,6 +575,13 @@ void ListBoxImpl::Create(Window &parent, int ctrlID, Point location_,
                           int lineHeight_, bool unicodeMode_,
                           Scintilla::Technology technology_) {
     (void)ctrlID; (void)lineHeight_; (void)unicodeMode_; (void)technology_;
+
+    /* Destroy any pre-existing plane to avoid resource leak on re-creation */
+    if (ncp) {
+        ncplane_destroy(ncp);
+        ncp = nullptr;
+        wid = nullptr;
+    }
 
     struct ncplane *parentPlane = static_cast<struct ncplane *>(parent.GetID());
     if (!parentPlane) return;

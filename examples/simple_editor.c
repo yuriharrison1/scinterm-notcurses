@@ -35,12 +35,16 @@ int main(int argc, char *argv[]) {
             fseek(f, 0, SEEK_END);
             long size = ftell(f);
             fseek(f, 0, SEEK_SET);
-            char *buf = malloc((size_t)size + 1);
-            if (buf) {
-                fread(buf, 1, (size_t)size, f);
-                buf[size] = '\0';
-                scintilla_send_message(editor, SCI_SETTEXT, 0, (sptr_t)buf);
-                free(buf);
+            if (size < 0) {
+                fprintf(stderr, "Cannot determine size of file: %s\n", argv[1]);
+            } else if (size > 0) {
+                char *buf = malloc((size_t)size + 1);
+                if (buf) {
+                    size_t nread = fread(buf, 1, (size_t)size, f);
+                    buf[nread] = '\0';
+                    scintilla_send_message(editor, SCI_SETTEXT, 0, (sptr_t)buf);
+                    free(buf);
+                }
             }
             fclose(f);
         } else {
@@ -57,21 +61,25 @@ int main(int argc, char *argv[]) {
     struct ncplane *plane = scintilla_get_plane(editor);
     struct notcurses *nc = ncplane_notcurses(plane);
 
-    /* Enable mouse */
     notcurses_mice_enable(nc, NCMICE_ALL_EVENTS);
 
     bool running = true;
     while (running) {
         scintilla_render(editor);
-        notcurses_render(nc);
         scintilla_update_cursor(editor);
+        notcurses_render(nc);
 
         ncinput input = {};
         uint32_t key = notcurses_get_blocking(nc, &input);
         if (key == (uint32_t)-1) break;
 
-        /* Ctrl+Q to quit */
-        if (key == 'q' && (input.modifiers & NCKEY_MOD_CTRL)) {
+        /* Skip key release events (Kitty protocol sends press+release pairs) */
+        if (input.evtype == NCTYPE_RELEASE) continue;
+
+        /* Ctrl+Q: notcurses delivers Ctrl+letter as uppercase with ctrl=1.
+         * Check raw 0x11, lowercase 'q', and uppercase 'Q'. */
+        bool ctrl = input.ctrl || (input.modifiers & NCKEY_MOD_CTRL);
+        if (key == 0x11 || ((key == 'q' || key == 'Q') && ctrl)) {
             running = false;
         } else if (key == NCKEY_RESIZE) {
             notcurses_refresh(nc, NULL, NULL);

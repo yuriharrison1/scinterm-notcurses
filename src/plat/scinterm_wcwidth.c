@@ -509,12 +509,13 @@ static const struct interval wide[] = {
     { 0x31350, 0x323AF },
 };
 
-/* Binary search in table of intervals */
-static int bisearch(uint32_t ucs, const struct interval *table, size_t max) {
-    size_t min = 0;
-    size_t mid;
+/* Binary search in table of intervals.
+ * max is the last valid index (signed to allow -1 as termination). */
+static int bisearch(uint32_t ucs, const struct interval *table, int max) {
+    int min = 0;
+    int mid;
 
-    if (ucs < table[0].first || ucs > table[max].last)
+    if (max < 0 || ucs < table[0].first || ucs > table[max].last)
         return 0;
     while (max >= min) {
         mid = (min + max) / 2;
@@ -538,11 +539,11 @@ int scinterm_wcwidth(uint32_t ucs) {
         return -1;
 
     /* Combining characters (zero width) */
-    if (bisearch(ucs, combining, sizeof(combining) / sizeof(combining[0]) - 1))
+    if (bisearch(ucs, combining, (int)(sizeof(combining) / sizeof(combining[0])) - 1))
         return 0;
 
     /* East Asian Wide and Fullwidth */
-    if (bisearch(ucs, wide, sizeof(wide) / sizeof(wide[0]) - 1))
+    if (bisearch(ucs, wide, (int)(sizeof(wide) / sizeof(wide[0])) - 1))
         return 2;
 
     return 1;
@@ -583,9 +584,11 @@ int scinterm_wcswidth_utf8(const char *str, int len) {
             break;
 
         for (int b = 1; b < bytes; b++) {
-            if ((unsigned char)str[i + b] == '\0')
+            unsigned char cb = (unsigned char)str[i + b];
+            /* Null terminator or invalid continuation byte — stop */
+            if (cb == '\0' || (cb & 0xC0) != 0x80)
                 goto done;
-            ucs = (ucs << 6) | ((unsigned char)str[i + b] & 0x3F);
+            ucs = (ucs << 6) | (cb & 0x3F);
         }
 
         int w = scinterm_wcwidth(ucs);

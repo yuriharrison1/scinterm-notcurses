@@ -186,9 +186,35 @@ void ScintillaNotCurses::Initialise() {
     /* Set the Scintilla main window to our plane */
     wMain = static_cast<WindowID>(ncp);
 
-    /* Configure default colours: dark theme */
+    /* Draw directly to the surface — no off-screen pixmap double-buffering.
+     * This matches the original scinterm (curses) behaviour and avoids the
+     * overhead of Copy() for every rendered line. */
+    view.bufferedDraw = false;
+
+    /* Force lineHeight=1: ViewStyle::Refresh always initialises maxDescent=1
+     * before inspecting font metrics, so lineHeight = lround(1+1) = 2 even
+     * when Descent() returns 0.  Setting extraDescent=-1 compensates:
+     *   maxDescent = max(0.0, 1 + (-1)) = 0  →  lineHeight = 1            */
+    vs.extraDescent = -1;
+
+    /* Do not let Scintilla draw its own caret block — it would paint a white
+     * rectangle on the terminal.  The terminal cursor is positioned via
+     * notcurses_cursor_enable() in UpdateCursor() instead.               */
+    WndProc(Message::SetCaretStyle, 0, 0); /* 0 = CARETSTYLE_INVISIBLE */
+
+    /* Disable caret line highlight — it paints the entire current line with
+     * a light background colour, which looks like a white band on terminal. */
+    WndProc(Message::SetCaretLineVisible, 0, 0);
+
+    /* Configure default colours: dark theme, then propagate to all styles */
     vs.styles[STYLE_DEFAULT].fore = ColourRGBA(0xD4, 0xD4, 0xD4);
     vs.styles[STYLE_DEFAULT].back = ColourRGBA(0x1E, 0x1E, 0x1E);
+    WndProc(Message::StyleClearAll, 0, 0);
+
+    /* Disable all margins — in terminal mode every column is precious */
+    for (int m = 0; m < 5; m++)
+        WndProc(Message::SetMarginWidthN, static_cast<uptr_t>(m), 0);
+
     InvalidateStyleRedraw();
 }
 
@@ -230,16 +256,44 @@ void ScintillaNotCurses::Paste() {
 
 void ScintillaNotCurses::Render() {
     if (!ncp) return;
-    /* Paint using Scintilla's built-in paint path */
-    Paint(nullptr, GetClientRectangle());
+
+    /* Fill the entire plane with the default background colour before painting
+     * so that any cell not explicitly drawn by Scintilla shows the editor
+     * background instead of the terminal's default (usually white). */
+    ColourRGBA bg = vs.styles[STYLE_DEFAULT].back;
+    uint64_t channels = 0;
+    ncchannels_set_bg_rgb8(&channels,
+        static_cast<unsigned>(bg.GetRed()),
+        static_cast<unsigned>(bg.GetGreen()),
+        static_cast<unsigned>(bg.GetBlue()));
+    ncchannels_set_fg_rgb8(&channels,
+        static_cast<unsigned>(bg.GetRed()),
+        static_cast<unsigned>(bg.GetGreen()),
+        static_cast<unsigned>(bg.GetBlue()));
+    ncplane_set_base(ncp, " ", 0, channels);
+    ncplane_erase(ncp);
+
+    /* Create a surface backed by our ncplane and pass it to Scintilla's paint path */
+    auto surface = Surface::Allocate(Technology::Default);
+    surface->Init(static_cast<WindowID>(ncp));
+    Paint(surface.get(), GetClientRectangle());
 }
 
 void ScintillaNotCurses::UpdateCursor() {
-    if (!ncp || !hasFocus) return;
+    if (!ncp) return;
+    struct notcurses *nc = ncplane_notcurses(ncp);
+    if (!nc) return;
+    if (!hasFocus) {
+        notcurses_cursor_disable(nc);
+        return;
+    }
     Point pt = PointMainCaret();
     int row = static_cast<int>(pt.y);
     int col = static_cast<int>(pt.x);
-    ncplane_cursor_move_yx(ncp, row, col);
+    /* Convert plane-relative coordinates to screen coordinates */
+    int py = 0, px = 0;
+    ncplane_yx(ncp, &py, &px);
+    notcurses_cursor_enable(nc, py + row, px + col);
 }
 
 void ScintillaNotCurses::Resize() {
@@ -297,12 +351,22 @@ void ScintillaNotCurses::SendKey(int key, int modifiers) {
                 KeyDownWithModifiers(Keys::Back, static_cast<KeyMod>(sciMods), nullptr);
                 return;
             } else if (key >= 0x20 && key < 0x7F) {
-                /* Regular printable ASCII character */
-                char ch[2] = { static_cast<char>(key), '\0' };
-                InsertCharacter(std::string_view(ch, 1), CharacterSource::DirectInput);
+                if (sciMods & (static_cast<int>(KeyMod::Ctrl) | static_cast<int>(KeyMod::Alt))) {
+                    /* Ctrl/Alt+key — pass as command, not text insertion.
+                     * Scintilla's keymap uses uppercase letters for commands. */
+                    int cmdKey = (key >= 'a' && key <= 'z') ? (key - 32) : key;
+                    KeyDownWithModifiers(static_cast<Keys>(cmdKey),
+                                        static_cast<KeyMod>(sciMods), nullptr);
+                } else {
+                    /* Regular printable ASCII character */
+                    char ch[2] = { static_cast<char>(key), '\0' };
+                    InsertCharacter(std::string_view(ch, 1), CharacterSource::DirectInput);
+                }
                 return;
-            } else if (key > 0x7F && key < 0x110000) {
-                /* Unicode codepoint — encode as UTF-8 */
+            } else if (key > 0x7F && key <= 0x10FFFF &&
+                       !(key >= 0xD800 && key <= 0xDFFF)) {
+                /* Unicode codepoint — encode as UTF-8.
+                 * Reject surrogates (D800-DFFF) and values beyond U+10FFFF. */
                 char utf8[5] = {};
                 uint32_t ucs = static_cast<uint32_t>(key);
                 int len = 0;
@@ -397,6 +461,9 @@ char *ScintillaNotCurses::GetClipboard(int *len) {
         return nullptr;
     }
     size_t sz = g_clipboard.size();
+    /* Guard against truncation: cap at INT_MAX bytes */
+    if (sz > static_cast<size_t>(INT_MAX))
+        sz = static_cast<size_t>(INT_MAX);
     char *result = static_cast<char *>(malloc(sz + 1));
     if (!result) {
         if (len) *len = 0;
