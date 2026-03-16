@@ -475,7 +475,45 @@ void SurfaceImpl::FlushDrawing() {}
 
 void SurfaceImpl::DrawLineMarker(const PRectangle &rcWhole, const Font *fontForCharacter,
                                   int tFold, const void *data) {
-    (void)rcWhole; (void)fontForCharacter; (void)tFold; (void)data;
+    if (!ncp || !data) return;
+    (void)fontForCharacter; (void)tFold;
+
+    const auto *lm = static_cast<const LineMarker *>(data);
+
+    /* Map Scintilla marker types to terminal characters.
+     * The fold margin is 1 cell wide, so we use single ASCII/Unicode chars.
+     * Box-tree style (default): [+] collapsed, [-] expanded, │ body,
+     * └ tail, ├ mid-tail; plus/minus and circle styles mapped similarly. */
+    const char *ch = nullptr;
+    using MS = MarkerSymbol;
+    switch (lm->markType) {
+        case MS::BoxPlus:              ch = "+"; break; /* collapsed head         */
+        case MS::BoxMinus:             ch = "-"; break; /* expanded head          */
+        case MS::BoxPlusConnected:     ch = "+"; break; /* collapsed head w/ body */
+        case MS::BoxMinusConnected:    ch = "-"; break; /* expanded head w/ body  */
+        case MS::VLine:                ch = "\xe2\x94\x82"; break; /* │ body     */
+        case MS::LCorner:              ch = "\xe2\x94\x94"; break; /* └ tail     */
+        case MS::LCornerCurve:         ch = "\xe2\x95\xb0"; break; /* ╰ tail     */
+        case MS::TCorner:              ch = "\xe2\x94\x9c"; break; /* ├ mid-tail */
+        case MS::TCornerCurve:         ch = "\xe2\x94\x9c"; break; /* ├ mid-tail */
+        case MS::Plus:                 ch = "+"; break;
+        case MS::Minus:                ch = "-"; break;
+        case MS::Arrow:                ch = ">"; break;
+        case MS::ArrowDown:            ch = "v"; break;
+        case MS::CirclePlus:           ch = "+"; break;
+        case MS::CircleMinus:          ch = "-"; break;
+        case MS::CirclePlusConnected:  ch = "+"; break;
+        case MS::CircleMinusConnected: ch = "-"; break;
+        default:                       return;          /* nothing to draw        */
+    }
+
+    int row = static_cast<int>(rcWhole.top);
+    int col = static_cast<int>(rcWhole.left);
+
+    SetNCColour(ncp, lm->fore, true);
+    SetNCColour(ncp, lm->back, false);
+    ncplane_set_styles(ncp, NCSTYLE_NONE);
+    ncplane_putstr_yx(ncp, row, col, ch);
 }
 
 void SurfaceImpl::DrawWrapMarker(PRectangle rcPlace, bool isEndMarker, ColourRGBA wrapColour) {

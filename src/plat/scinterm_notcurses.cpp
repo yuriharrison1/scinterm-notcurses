@@ -91,6 +91,22 @@ using namespace Scintilla::Internal;
 static std::string g_clipboard;
 
 /*=============================================================================
+ * Fold marker drawing callback
+ *===========================================================================*/
+
+/* Called by Scintilla's LineMarker::Draw() when customDraw is set.
+ * Casts the surface to SurfaceImpl and delegates to DrawLineMarker()
+ * which renders an ASCII/Unicode character in the 1-cell fold margin. */
+static void DrawFoldMarkerCallback(Surface *surface, const PRectangle &rcWhole,
+                                   const Font *fontForCharacter, int tFold,
+                                   Scintilla::MarginType /*marginStyle*/,
+                                   const void *lineMarker) {
+    auto *surf = static_cast<SurfaceImpl *>(surface);
+    if (surf)
+        surf->DrawLineMarker(rcWhole, fontForCharacter, tFold, lineMarker);
+}
+
+/*=============================================================================
  * ScintillaNotCurses class
  *===========================================================================*/
 
@@ -219,6 +235,27 @@ void ScintillaNotCurses::Initialise() {
     for (int m = 0; m < 5; m++)
         WndProc(Message::SetMarginWidthN, static_cast<uptr_t>(m), 0);
 
+    /* In terminal mode 1 unit = 1 character cell.  The default
+     * marginNumberPadding=3 (GUI pixels) would consume 3 character columns on
+     * the right of the line-number margin, causing numbers to start at a
+     * negative x for anything beyond single digits.  Set it to 0 so that line
+     * numbers are right-justified flush to the margin edge. */
+    vs.marginNumberPadding = 0;
+
+    /* Register terminal fold marker renderer.
+     * Scintilla's built-in DrawFoldingMark() uses pixel-level geometry that
+     * is meaningless in a terminal (1 cell = 1 unit).  Setting customDraw on
+     * the 7 fold-marker slots redirects rendering to DrawFoldMarkerCallback,
+     * which draws a single ASCII/Unicode character per cell instead.
+     * This survives subsequent SCI_MARKERDEFINE calls because MarkerDefine
+     * only updates markType, leaving customDraw untouched.                  */
+    /* Marker numbers 25-31 are the 7 fold-related slots (see Scintilla.h).
+     * SC_MARKNUM_FOLDEREND=25 … SC_MARKNUM_FOLDEROPEN=31                  */
+    for (int m = 25; m <= 31; ++m) {
+        if (m < static_cast<int>(vs.markers.size()))
+            vs.markers[m].customDraw = DrawFoldMarkerCallback;
+    }
+
     InvalidateStyleRedraw();
 }
 
@@ -302,11 +339,10 @@ void ScintillaNotCurses::UpdateCursor() {
 
 void ScintillaNotCurses::Resize() {
     if (!ncp) return;
-    struct ncplane *stdplane = GetStdPlane();
-    if (!stdplane) return;
-    unsigned rows = 0, cols = 0;
-    ncplane_dim_yx(stdplane, &rows, &cols);
-    ncplane_resize_simple(ncp, rows, cols);
+    /* Do NOT resize the plane here.  The caller (scintilla_resize()) already
+     * set the plane to the desired dimensions (e.g. rows-2 to leave room for
+     * tab bar and status bar).  Just inform Scintilla of the new size so it
+     * can update scroll bars and layout. */
     ChangeSize();
 }
 
