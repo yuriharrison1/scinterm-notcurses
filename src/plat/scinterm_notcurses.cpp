@@ -217,6 +217,14 @@ void ScintillaNotCurses::Initialise() {
      *   maxDescent = max(0.0, 1 + (-1)) = 0  →  lineHeight = 1            */
     vs.extraDescent = -1;
 
+    /* Terminal rendering is single-pass: DrawTextNoClip receives both fg and
+     * bg colours in one call, which is the only way to preserve selection
+     * background in NotCurses.  With the default PhasesDraw::Two, the
+     * foreground phase uses DrawTextTransparent which calls
+     * ncplane_set_bg_default() and erases whatever background FillRectangle
+     * painted in phase 1, making selections invisible.                    */
+    WndProc(Message::SetPhasesDraw, 0, 0); /* 0 = SC_PHASES_ONE */
+
     /* Do not let Scintilla draw its own caret block — it would paint a white
      * rectangle on the terminal.  The terminal cursor is positioned via
      * notcurses_cursor_enable() in UpdateCursor() instead.               */
