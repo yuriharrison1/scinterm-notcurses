@@ -306,9 +306,8 @@ void ScintillaNotCurses::Paste() {
 void ScintillaNotCurses::Render() {
     if (!ncp) return;
 
-    /* Fill the entire plane with the default background colour before painting
-     * so that any cell not explicitly drawn by Scintilla shows the editor
-     * background instead of the terminal's default (usually white). */
+    /* Set the base cell used for cells not explicitly painted by Scintilla.
+     * Fill with the theme background colour so unpainted cells match the theme. */
     ColourRGBA bg = vs.styles[STYLE_DEFAULT].back;
     uint64_t channels = 0;
     ncchannels_set_bg_rgb8(&channels,
@@ -604,6 +603,10 @@ void scintilla_set_color_offsets(int color_offset, int pair_offset) {
     (void)color_offset;
     (void)pair_offset;
     /* No-op: NotCurses uses direct true color */
+}
+
+void scintilla_set_bg_alpha(int pct) {
+    SetBgAlpha(pct);
 }
 
 bool scintilla_set_lexer(void *sci, const char *name, const char *lexers_dir) {

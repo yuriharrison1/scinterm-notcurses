@@ -61,6 +61,15 @@ struct notcurses* GetNotCurses();
  */
 struct ncplane* GetStdPlane();
 
+/**
+ * @brief Set the background alpha level for all Scintilla rendering.
+ * @param pct Transparency percentage: 0 = opaque, 1-99 = blend, 100 = fully transparent.
+ */
+void SetBgAlpha(int pct);
+
+/** Returns the current background notcurses alpha constant. */
+unsigned GetBgAlphaNc();
+
 /*=============================================================================
  * Font implementation
  *===========================================================================*/

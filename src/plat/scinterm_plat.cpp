@@ -92,6 +92,14 @@ bool InitNotCurses() {
     g_nc = notcurses_init(&opts, nullptr);
     if (!g_nc) return false;
     g_stdplane = notcurses_stdplane(g_nc);
+    /* Make stdplane fully transparent so that NCALPHA_BLEND/TRANSPARENT cells
+     * on upper planes blend with or show through to the terminal's own background
+     * (enabling terminal transparency effects). */
+    uint64_t trans = 0;
+    ncchannels_set_fg_alpha(&trans, NCALPHA_TRANSPARENT);
+    ncchannels_set_bg_alpha(&trans, NCALPHA_TRANSPARENT);
+    ncplane_set_base(g_stdplane, " ", 0, trans);
+    ncplane_erase(g_stdplane);
     return true;
 }
 
@@ -105,6 +113,23 @@ void ShutdownNotCurses() {
 
 struct notcurses* GetNotCurses() { return g_nc; }
 struct ncplane* GetStdPlane() { return g_stdplane; }
+
+/*=============================================================================
+ * Background alpha
+ *===========================================================================*/
+
+static unsigned g_bg_alpha_nc = NCALPHA_OPAQUE;
+
+void SetBgAlpha(int pct) {
+    /* NCALPHA_BLEND only mixes between notcurses planes; since the stdplane is
+     * transparent there is nothing below to blend with, so BLEND produces no
+     * visible change.  Any non-zero percentage maps to NCALPHA_TRANSPARENT so
+     * that cells use the terminal's own default background, which respects the
+     * terminal's window-level transparency (e.g. WezTerm window_background_opacity). */
+    g_bg_alpha_nc = (pct > 0) ? NCALPHA_TRANSPARENT : NCALPHA_OPAQUE;
+}
+
+unsigned GetBgAlphaNc() { return g_bg_alpha_nc; }
 
 /*=============================================================================
  * Helper utilities
@@ -792,14 +817,11 @@ int DefaultFontSize() { return 10; }
 unsigned int DoubleClickTime() { return 500; }
 
 void DebugDisplay(const char *s) noexcept {
-    fprintf(stderr, "%s", s);
+    (void)s; /* no-op: stderr writes corrupt notcurses display */
 }
 
 void DebugPrintf(const char *format, ...) noexcept {
-    va_list ap;
-    va_start(ap, format);
-    vfprintf(stderr, format, ap);
-    va_end(ap);
+    (void)format; /* no-op: stderr writes corrupt notcurses display */
 }
 
 bool ShowAssertionPopUps(bool /*assertionPopUps*/) noexcept {

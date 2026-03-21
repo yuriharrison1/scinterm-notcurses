@@ -221,6 +221,18 @@ char *scintilla_get_clipboard(void *sci, int *len);
  */
 void scintilla_set_color_offsets(int color_offset, int pair_offset);
 
+/**
+ * @brief Set the background transparency level for all Scintilla rendering.
+ *
+ * Controls how Scintilla's background cells blend with the terminal background:
+ *   0        - fully opaque (theme background colour shown)
+ *   1 .. 99  - blend mode (50/50 mix with the plane below)
+ *   100      - fully transparent (terminal background shows through)
+ *
+ * @param pct Transparency percentage [0, 100].
+ */
+void scintilla_set_bg_alpha(int pct);
+
 /*=============================================================================
  * Syntax highlighting via Scintillua
  *===========================================================================*/
