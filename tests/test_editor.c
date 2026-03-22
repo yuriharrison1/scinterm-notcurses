@@ -19,7 +19,7 @@ static int tests_failed = 0;
     else { tests_failed++; printf("FAIL: %s\n", name); } \
 } while(0)
 
-static void dummy_callback(void *sci, int msg, SCNotification *n, void *ud) {
+static void dummy_callback(ScintillaHandle *sci, int msg, SCNotification *n, void *ud) {
     (void)sci; (void)msg; (void)n; (void)ud;
 }
 
@@ -36,7 +36,7 @@ int main(void) {
     }
 
     /* Test create */
-    void *sci = scintilla_new(dummy_callback, NULL);
+    ScintillaHandle *sci = scintilla_new(dummy_callback, NULL);
     TEST("create editor", sci != NULL);
 
     if (!sci) {

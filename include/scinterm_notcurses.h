@@ -17,6 +17,41 @@
 #include <stddef.h>
 #include "Scintilla.h"
 
+/*=============================================================================
+ * Graphics protocol
+ *
+ * Defined outside extern "C" so it is a plain C typedef enum that compiles
+ * identically in both C and C++ translation units.
+ *===========================================================================*/
+
+/**
+ * @brief Terminal pixel-graphics capability level.
+ *
+ * Scinterm itself renders only text, but the protocol it reports to NotCurses
+ * influences the NCOPTION flags passed to notcurses_init() and therefore
+ * how NotCurses manages pixel-graphics content already on screen (e.g. inline
+ * images drawn by the shell before the editor launched).
+ *
+ * Detection order (AUTO):
+ *   1. $TERM_PROGRAM: "kitty" / "WezTerm" / "ghostty" / "iTerm.app" → KITTY
+ *   2. $TERM: "xterm-kitty" / "xterm-ghostty" → KITTY
+ *             "mlterm" / "foot" / "yaft" / contains "sixel" → SIXEL
+ *   3. notcurses_check_pixel_support() at runtime for final resolution.
+ *
+ * Call scinterm_set_graphics_protocol() BEFORE scintilla_notcurses_init() to
+ * override auto-detection.  If not called, SCINTERM_GRAPHICS_AUTO is used.
+ */
+typedef enum ScintermGraphicsProtocol {
+    /** Detect from $TERM / $TERM_PROGRAM and notcurses capabilities (default). */
+    SCINTERM_GRAPHICS_AUTO  = 0,
+    /** Kitty Graphics Protocol (kitty, WezTerm, Ghostty, iTerm2 ≥ 3.5).      */
+    SCINTERM_GRAPHICS_KITTY = 1,
+    /** Sixel pixel graphics (mlterm, foot, xterm+sixel, yaft).                */
+    SCINTERM_GRAPHICS_SIXEL = 2,
+    /** No pixel graphics; plain text / ANSI only.                             */
+    SCINTERM_GRAPHICS_NONE  = 3
+} ScintermGraphicsProtocol;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -36,6 +71,22 @@ extern "C" {
 
 /** Mouse button release event */
 #define SCM_RELEASE 3
+
+/*=============================================================================
+ * Graphics protocol override
+ *===========================================================================*/
+
+/**
+ * @brief Override the graphics protocol used during NotCurses initialization.
+ *
+ * Must be called BEFORE scintilla_notcurses_init().  After initialization the
+ * value is locked in; calling this function afterwards has no effect.
+ *
+ * @param protocol  Desired protocol, or SCINTERM_GRAPHICS_AUTO (default) to
+ *                  let Scinterm detect it from environment variables and the
+ *                  notcurses pixel-support query.
+ */
+void scinterm_set_graphics_protocol(ScintermGraphicsProtocol protocol);
 
 /*=============================================================================
  * Initialization and cleanup
@@ -64,30 +115,46 @@ void scintilla_notcurses_shutdown(void);
  *===========================================================================*/
 
 /**
+ * @brief Opaque handle to a Scinterm editor instance
+ * 
+ * ARCHITECTURE: Provides type safety over raw void* pointers.
+ * The actual implementation is internal and subject to change.
+ */
+typedef struct ScintillaNotCurses ScintillaHandle;
+
+/**
+ * @brief Notification callback signature
+ * @param sci Editor instance that sent the notification
+ * @param iMessage Message code (see ScintillaMessages.h)
+ * @param n Notification data structure
+ * @param userdata User data passed during creation
+ */
+typedef void (*ScintillaCallback)(ScintillaHandle *sci, int iMessage, 
+                                   SCNotification *n, void *userdata);
+
+/**
  * @brief Create a new Scinterm editor instance.
  * 
  * @param callback Notification callback function. Called for various Scintilla events.
  * @param userdata User data to pass to the callback.
- * @return Pointer to the Scinterm instance, or NULL on failure.
+ * @return Handle to the Scinterm instance, or NULL on failure.
  */
-void *scintilla_new(
-    void (*callback)(void *sci, int iMessage, SCNotification *n, void *userdata), 
-    void *userdata);
+ScintillaHandle *scintilla_new(ScintillaCallback callback, void *userdata);
 
 /**
  * @brief Get the NotCurses plane associated with a Scinterm instance.
  * 
- * @param sci Scinterm instance.
+ * @param sci Scinterm instance handle.
  * @return NotCurses plane, or NULL if not created yet.
  */
-struct ncplane *scintilla_get_plane(void *sci);
+struct ncplane *scintilla_get_plane(ScintillaHandle *sci);
 
 /**
  * @brief Delete a Scinterm instance and free all resources.
  * 
- * @param sci Scinterm instance to delete.
+ * @param sci Scinterm instance handle to delete.
  */
-void scintilla_delete(void *sci);
+void scintilla_delete(ScintillaHandle *sci);
 
 /*=============================================================================
  * Scintilla message passing
@@ -105,7 +172,7 @@ void scintilla_delete(void *sci);
  * @param lParam Second message parameter.
  * @return Message-specific return value.
  */
-sptr_t scintilla_send_message(void *sci, unsigned int iMessage, uptr_t wParam, sptr_t lParam);
+sptr_t scintilla_send_message(ScintillaHandle *sci, unsigned int iMessage, uptr_t wParam, sptr_t lParam);
 
 /*=============================================================================
  * Input handling
@@ -118,7 +185,7 @@ sptr_t scintilla_send_message(void *sci, unsigned int iMessage, uptr_t wParam, s
  * @param key Key code (using NotCurses key definitions from <notcurses/notcurses.h>).
  * @param modifiers Bitmask of SCMOD_* modifiers (Ctrl, Alt, Shift).
  */
-void scintilla_send_key(void *sci, int key, int modifiers);
+void scintilla_send_key(ScintillaHandle *sci, int key, int modifiers);
 
 /**
  * @brief Send a mouse event to Scinterm.
@@ -131,7 +198,7 @@ void scintilla_send_key(void *sci, int key, int modifiers);
  * @param x Absolute X coordinate (screen coordinates).
  * @return true if the event was handled, false otherwise.
  */
-bool scintilla_send_mouse(void *sci, int event, int button, int modifiers, int y, int x);
+bool scintilla_send_mouse(ScintillaHandle *sci, int event, int button, int modifiers, int y, int x);
 
 /**
  * @brief Process input from NotCurses and dispatch to Scinterm.
@@ -143,7 +210,7 @@ bool scintilla_send_mouse(void *sci, int event, int button, int modifiers, int y
  * @param nc NotCurses context.
  * @return true if the input was handled, false otherwise.
  */
-bool scintilla_process_input(void *sci, struct notcurses *nc);
+bool scintilla_process_input(ScintillaHandle *sci, struct notcurses *nc);
 
 /*=============================================================================
  * Rendering and display
@@ -158,7 +225,7 @@ bool scintilla_process_input(void *sci, struct notcurses *nc);
  * 
  * @param sci Scinterm instance.
  */
-void scintilla_render(void *sci);
+void scintilla_render(ScintillaHandle *sci);
 
 /**
  * @brief Update the cursor position.
@@ -169,7 +236,7 @@ void scintilla_render(void *sci);
  * 
  * @param sci Scinterm instance.
  */
-void scintilla_update_cursor(void *sci);
+void scintilla_update_cursor(ScintillaHandle *sci);
 
 /**
  * @brief Handle terminal resize events.
@@ -179,7 +246,7 @@ void scintilla_update_cursor(void *sci);
  * 
  * @param sci Scinterm instance.
  */
-void scintilla_resize(void *sci);
+void scintilla_resize(ScintillaHandle *sci);
 
 /**
  * @brief Set focus state for the Scinterm instance.
@@ -189,7 +256,7 @@ void scintilla_resize(void *sci);
  * @param sci Scinterm instance.
  * @param focus true if the window has focus, false otherwise.
  */
-void scintilla_set_focus(void *sci, bool focus);
+void scintilla_set_focus(ScintillaHandle *sci, bool focus);
 
 /*=============================================================================
  * Clipboard operations
@@ -204,7 +271,7 @@ void scintilla_set_focus(void *sci, bool focus);
  * @param len Optional pointer to store the length of the text.
  * @return Allocated string containing the clipboard text, or NULL on error.
  */
-char *scintilla_get_clipboard(void *sci, int *len);
+char *scintilla_get_clipboard(ScintillaHandle *sci, int *len);
 
 /*=============================================================================
  * Compatibility functions
@@ -249,7 +316,7 @@ void scintilla_set_bg_alpha(int pct);
  *                   reuse the last path set.
  * @return true if the lexer was set successfully, false otherwise.
  */
-bool scintilla_set_lexer(void *sci, const char *name, const char *lexers_dir);
+bool scintilla_set_lexer(ScintillaHandle *sci, const char *name, const char *lexers_dir);
 
 #ifdef __cplusplus
 }

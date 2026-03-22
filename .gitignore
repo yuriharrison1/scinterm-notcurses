@@ -51,3 +51,22 @@ coverage/
 # Documentation
 docs/html/
 docs/latex/
+
+# Build directories
+build/
+build_*/
+
+# Temporary files
+*.o
+*.a
+*.so
+*.so.*
+
+# Documentation backups
+*.md.bak
+
+# RPM files (large binaries)
+*.src.rpm
+
+# Claude IDE
+.claude/

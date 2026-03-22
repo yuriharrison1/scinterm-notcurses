@@ -13,7 +13,7 @@
 
 static int active_editor = 0;  /* 0 = left, 1 = right */
 
-static void on_notify(void *sci, int msg, SCNotification *n, void *ud) {
+static void on_notify(ScintillaHandle *sci, int msg, SCNotification *n, void *ud) {
     (void)sci; (void)msg; (void)n; (void)ud;
 }
 
@@ -24,7 +24,7 @@ int main(void) {
     }
 
     /* Get nc context from the first editor's plane */
-    void *editor_left = scintilla_new(on_notify, NULL);
+    ScintillaHandle *editor_left = scintilla_new(on_notify, NULL);
     if (!editor_left) {
         fprintf(stderr, "Failed to create left editor\n");
         scintilla_notcurses_shutdown();
@@ -44,7 +44,7 @@ int main(void) {
     ncplane_move_yx(left_plane, 0, 0);
 
     /* Create right editor */
-    void *editor_right = scintilla_new(on_notify, NULL);
+    ScintillaHandle *editor_right = scintilla_new(on_notify, NULL);
     if (!editor_right) {
         fprintf(stderr, "Failed to create right editor\n");
         scintilla_delete(editor_left);
@@ -113,7 +113,7 @@ int main(void) {
                 active_editor = 0;
             }
         } else {
-            void *active = (active_editor == 0) ? editor_left : editor_right;
+            ScintillaHandle *active = (active_editor == 0) ? editor_left : editor_right;
             scintilla_send_key(active, (int)key, (int)input.modifiers);
         }
     }

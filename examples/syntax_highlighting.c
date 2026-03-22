@@ -29,7 +29,7 @@
 #define SCI_SETLEXERLANGUAGE 4006
 #endif
 
-static void on_notify(void *sci, int msg, SCNotification *n, void *ud) {
+static void on_notify(ScintillaHandle *sci, int msg, SCNotification *n, void *ud) {
     (void)sci; (void)msg; (void)n; (void)ud;
 }
 
@@ -164,7 +164,7 @@ int main(void) {
         return 1;
     }
 
-    void *editor = scintilla_new(on_notify, NULL);
+    ScintillaHandle *editor = scintilla_new(on_notify, NULL);
     if (!editor) {
         fprintf(stderr, "Failed to create editor\n");
         scintilla_notcurses_shutdown();

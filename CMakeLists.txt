@@ -119,6 +119,9 @@ set(PLATFORM_SOURCES
     src/plat/scinterm_plat.cpp
     src/plat/scinterm_notcurses.cpp
     src/plat/scinterm_wcwidth.c
+    # src/plat/scinterm_pool.cpp          # Placeholder - requires full Scintilla headers
+    # src/plat/scinterm_thread_pool.cpp   # Placeholder - requires full Scintilla headers  
+    # src/plat/scinterm_parallel_render.cpp # Placeholder - requires Scintilla integration
 )
 
 set(ALL_SOURCES
@@ -273,6 +276,18 @@ install(FILES ${PUBLIC_HEADERS}
 # ============================================================================
 
 if(BUILD_EXAMPLES)
+    add_executable(scinterm_quick examples/quick_start.c)
+    target_include_directories(scinterm_quick PRIVATE
+        include ${SCINTILLA_INCLUDE_DIR} ${NOTCURSES_INCLUDE_DIRS})
+    target_link_libraries(scinterm_quick
+        ${TARGET_NAME}
+        ${NOTCURSES_LIBRARIES}
+        m
+    )
+    set_target_properties(scinterm_quick PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+
     add_executable(scinterm_example examples/simple_editor.c)
     target_include_directories(scinterm_example PRIVATE
         include ${SCINTILLA_INCLUDE_DIR} ${NOTCURSES_INCLUDE_DIRS})
@@ -313,7 +328,7 @@ if(BUILD_EXAMPLES)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
 
-    install(TARGETS scinterm_example scinterm_multi scinterm_syntax
+    install(TARGETS scinterm_quick scinterm_example scinterm_multi scinterm_syntax
         RUNTIME DESTINATION bin
     )
 endif()
@@ -325,6 +340,7 @@ endif()
 if(BUILD_TESTING)
     enable_testing()
 
+    # Main integration test - requires full library
     add_executable(scinterm_test tests/test_editor.c)
     target_include_directories(scinterm_test PRIVATE
         include ${SCINTILLA_INCLUDE_DIR} ${NOTCURSES_INCLUDE_DIRS})
@@ -334,6 +350,69 @@ if(BUILD_TESTING)
         m
     )
     add_test(NAME scinterm_test COMMAND scinterm_test)
+
+    # Pure C unit tests (no external dependencies)
+    add_executable(test_arena tests/test_arena.c)
+    target_compile_options(test_arena PRIVATE -std=c99)
+    add_test(NAME test_arena COMMAND test_arena)
+
+    add_executable(test_dirty tests/test_dirty.c)
+    target_compile_options(test_dirty PRIVATE -std=c99)
+    add_test(NAME test_dirty COMMAND test_dirty)
+
+    add_executable(test_graphics_proto tests/test_graphics_proto.c)
+    target_compile_options(test_graphics_proto PRIVATE -std=c99)
+    add_test(NAME test_graphics_proto COMMAND test_graphics_proto)
+
+    add_executable(test_security tests/test_security.c)
+    target_compile_options(test_security PRIVATE -std=c99)
+    add_test(NAME test_security COMMAND test_security)
+
+    # Component tests that require NotCurses
+    add_executable(test_listbox tests/test_listbox.c)
+    target_include_directories(test_listbox PRIVATE
+        include ${SCINTILLA_INCLUDE_DIR} ${NOTCURSES_INCLUDE_DIRS})
+    target_link_libraries(test_listbox
+        ${TARGET_NAME}
+        ${NOTCURSES_LIBRARIES}
+        m
+    )
+    add_test(NAME test_listbox COMMAND test_listbox)
+
+    add_executable(test_surface_copy tests/test_surface_copy.c)
+    target_include_directories(test_surface_copy PRIVATE
+        include ${SCINTILLA_INCLUDE_DIR} ${NOTCURSES_INCLUDE_DIRS})
+    target_link_libraries(test_surface_copy
+        ${TARGET_NAME}
+        ${NOTCURSES_LIBRARIES}
+        m
+    )
+    add_test(NAME test_surface_copy COMMAND test_surface_copy)
+
+    add_executable(test_timing tests/test_timing.c)
+    target_include_directories(test_timing PRIVATE
+        include ${SCINTILLA_INCLUDE_DIR} ${NOTCURSES_INCLUDE_DIRS})
+    target_link_libraries(test_timing
+        ${TARGET_NAME}
+        ${NOTCURSES_LIBRARIES}
+        m
+    )
+    add_test(NAME test_timing COMMAND test_timing)
+
+    add_executable(test_event_loop tests/test_event_loop.c)
+    target_include_directories(test_event_loop PRIVATE
+        include ${SCINTILLA_INCLUDE_DIR} ${NOTCURSES_INCLUDE_DIRS})
+    target_link_libraries(test_event_loop
+        ${TARGET_NAME}
+        ${NOTCURSES_LIBRARIES}
+        m
+    )
+    add_test(NAME test_event_loop COMMAND test_event_loop)
+
+    # Set output directories for all test executables
+    set_target_properties(test_arena test_dirty test_graphics_proto
+        test_listbox test_surface_copy test_timing test_event_loop
+        PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
 
 # ============================================================================

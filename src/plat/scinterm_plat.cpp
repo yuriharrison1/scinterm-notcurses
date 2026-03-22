@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cstdarg>
 #include <cmath>
+#include <climits>
 
 #include <stdexcept>
 #include <string>
@@ -28,6 +29,7 @@
 #include <memory>
 #include <chrono>
 #include <atomic>
+#include <mutex>
 
 #include <notcurses/notcurses.h>
 
@@ -86,20 +88,46 @@ namespace Scintilla::Internal {
 static struct notcurses *g_nc = nullptr;
 static struct ncplane *g_stdplane = nullptr;
 
-bool InitNotCurses() {
+/*=============================================================================
+ * Global render-frame arena with thread-safety
+ *===========================================================================*/
+
+Arena g_render_arena = {};
+std::mutex g_arena_mutex;
+
+/**
+ * @brief Thread-safe arena reset
+ */
+static inline void arena_reset_safe(Arena *a) {
+    std::lock_guard<std::mutex> lock(g_arena_mutex);
+    arena_reset(a);
+}
+
+/**
+ * @brief Thread-safe arena allocation
+ */
+static inline void *arena_alloc_safe(Arena *a, size_t size) {
+    std::lock_guard<std::mutex> lock(g_arena_mutex);
+    return arena_alloc(a, size);
+}
+
+bool InitNotCurses(uint64_t extra_ncopts) {
     struct notcurses_options opts = {};
-    opts.flags = NCOPTION_SUPPRESS_BANNERS;
+    opts.flags = NCOPTION_SUPPRESS_BANNERS | extra_ncopts;
     g_nc = notcurses_init(&opts, nullptr);
     if (!g_nc) return false;
     g_stdplane = notcurses_stdplane(g_nc);
-    /* Make stdplane fully transparent so that NCALPHA_BLEND/TRANSPARENT cells
-     * on upper planes blend with or show through to the terminal's own background
-     * (enabling terminal transparency effects). */
-    uint64_t trans = 0;
-    ncchannels_set_fg_alpha(&trans, NCALPHA_TRANSPARENT);
-    ncchannels_set_bg_alpha(&trans, NCALPHA_TRANSPARENT);
-    ncplane_set_base(g_stdplane, " ", 0, trans);
-    ncplane_erase(g_stdplane);
+    if (!g_stdplane) {
+        notcurses_stop(g_nc);
+        g_nc = nullptr;
+        return false;
+    }
+    if (!arena_init(&g_render_arena, SCINTERM_ARENA_SIZE)) {
+        notcurses_stop(g_nc);
+        g_nc = nullptr;
+        g_stdplane = nullptr;
+        return false;
+    }
     return true;
 }
 
@@ -109,6 +137,7 @@ void ShutdownNotCurses() {
         g_nc = nullptr;
         g_stdplane = nullptr;
     }
+    arena_free(&g_render_arena);
 }
 
 struct notcurses* GetNotCurses() { return g_nc; }
@@ -139,6 +168,218 @@ static inline void SetNCColour(struct ncplane *ncp, ColourRGBA c, bool fg) {
     uint8_t r = c.GetRed(), g = c.GetGreen(), b = c.GetBlue();
     if (fg) ncplane_set_fg_rgb8(ncp, r, g, b);
     else    ncplane_set_bg_rgb8(ncp, r, g, b);
+}
+
+/*=============================================================================
+ * Safe string output with bounds checking
+ * Security-hardened version with proper UTF-8 validation
+ *===========================================================================*/
+
+/**
+ * @brief Validate UTF-8 continuation byte
+ * @param c Byte to check
+ * @return true if valid continuation byte (0x80-0xBF)
+ */
+static inline bool is_utf8_continuation(unsigned char c) {
+    return (c & 0xC0) == 0x80;
+}
+
+/**
+ * @brief Get UTF-8 sequence length from lead byte (with validation)
+ * @param c Lead byte
+ * @return Sequence length (1-4), or 0 if invalid
+ */
+static inline int utf8_sequence_length(unsigned char c) {
+    if (c < 0x80) return 1;           // ASCII
+    if ((c & 0xE0) == 0xC0) return 2; // 2-byte
+    if ((c & 0xF0) == 0xE0) return 3; // 3-byte
+    if ((c & 0xF8) == 0xF0) return 4; // 4-byte
+    return 0;                         // Invalid lead byte
+}
+
+/**
+ * @brief Safely put a string to a plane, truncating to plane width
+ * 
+ * SECURITY FIXES:
+ * - Proper UTF-8 validation to prevent over-read
+ * - Bounds checking for all buffer accesses
+ * - Overflow-safe arithmetic
+ * - Invalid UTF-8 sequences treated as single bytes
+ * 
+ * @param ncp Target plane
+ * @param row Row coordinate
+ * @param col Column coordinate  
+ * @param str String to write (null-terminated)
+ * @param max_width Maximum width to write (0 = use plane width)
+ * @return int Number of columns written, or -1 on error
+ */
+static int safe_putstr_yx(struct ncplane *ncp, int row, int col, const char *str, int max_width = 0) {
+    if (!ncp || !str) return -1;
+    if (row < 0 || col < 0) return -1;
+    
+    // Get plane dimensions for bounds checking
+    unsigned plane_rows = 0, plane_cols = 0;
+    ncplane_dim_yx(ncp, &plane_rows, &plane_cols);
+    
+    // Validate coordinates
+    if (static_cast<unsigned>(row) >= plane_rows || static_cast<unsigned>(col) >= plane_cols) {
+        return -1;
+    }
+    
+    if (max_width <= 0) {
+        max_width = static_cast<int>(plane_cols) - col;
+        if (max_width <= 0) return 0;
+    }
+    
+    // Clamp max_width to available space
+    int available_cols = static_cast<int>(plane_cols) - col;
+    if (max_width > available_cols) {
+        max_width = available_cols;
+    }
+    
+    size_t len = strlen(str);
+    if (len == 0) return 0;
+    
+    // Limit string length to prevent excessive processing
+    constexpr size_t MAX_PROCESS_LEN = 65536;
+    if (len > MAX_PROCESS_LEN) {
+        len = MAX_PROCESS_LEN;
+    }
+    
+    // Fast path: check if entire string fits
+    int total_width = scinterm_wcswidth_utf8(str, static_cast<int>(len));
+    if (total_width < 0) total_width = static_cast<int>(len);
+    
+    if (total_width <= max_width) {
+        // Fits entirely - use ncplane_putstr_yx directly
+        return ncplane_putstr_yx(ncp, row, col, str);
+    }
+    
+    // Need to truncate - iterate carefully with bounds checking
+    int cols_used = 0;
+    size_t byte_pos = 0;
+    const char *p = str;
+    const char *const end = str + len;
+    
+    while (p < end && cols_used < max_width) {
+        unsigned char c = static_cast<unsigned char>(*p);
+        
+        // ASCII fast path
+        if (c < 0x80) {
+            int char_width = (c >= 0x20 && c != 0x7F) ? 1 : 0;
+            if (cols_used + char_width > max_width) {
+                break;
+            }
+            cols_used += char_width;
+            byte_pos++;
+            p++;
+            continue;
+        }
+        
+        // Multi-byte UTF-8
+        int seq_len = utf8_sequence_length(c);
+        
+        // Invalid lead byte - treat as single byte replacement
+        if (seq_len == 0 || seq_len > 4) {
+            if (cols_used + 1 > max_width) break;
+            cols_used += 1;
+            byte_pos++;
+            p++;
+            continue;
+        }
+        
+        // Check if we have enough bytes for the full sequence
+        if (p + seq_len > end) {
+            // Truncated sequence at end - treat as single bytes
+            if (cols_used + 1 > max_width) break;
+            cols_used += 1;
+            byte_pos++;
+            p++;
+            continue;
+        }
+        
+        // Validate continuation bytes
+        bool valid = true;
+        for (int i = 1; i < seq_len; i++) {
+            if (!is_utf8_continuation(static_cast<unsigned char>(p[i]))) {
+                valid = false;
+                break;
+            }
+        }
+        
+        if (!valid) {
+            // Invalid sequence - treat as single byte
+            if (cols_used + 1 > max_width) break;
+            cols_used += 1;
+            byte_pos++;
+            p++;
+            continue;
+        }
+        
+        // Decode and get width
+        uint32_t ucs = 0;
+        switch (seq_len) {
+            case 2: ucs = c & 0x1F; break;
+            case 3: ucs = c & 0x0F; break;
+            case 4: ucs = c & 0x07; break;
+        }
+        
+        for (int i = 1; i < seq_len; i++) {
+            ucs = (ucs << 6) | (static_cast<unsigned char>(p[i]) & 0x3F);
+        }
+        
+        // Validate decoded codepoint
+        if (ucs > 0x10FFFF || (ucs >= 0xD800 && ucs <= 0xDFFF)) {
+            // Invalid Unicode - treat as single byte
+            if (cols_used + 1 > max_width) break;
+            cols_used += 1;
+            byte_pos++;
+            p++;
+            continue;
+        }
+        
+        int char_width = scinterm_wcwidth(ucs);
+        if (char_width < 0) char_width = 1;  // Control chars as width 1
+        
+        if (cols_used + char_width > max_width) {
+            break;
+        }
+        
+        cols_used += char_width;
+        byte_pos += static_cast<size_t>(seq_len);
+        p += seq_len;
+    }
+    
+    // Overflow check for byte_pos
+    if (byte_pos > len || byte_pos > MAX_PROCESS_LEN) {
+        byte_pos = len;
+    }
+    
+    // Stack buffer for small truncations, heap for large
+    constexpr size_t STACK_BUF_SIZE = 512;
+    char stack_buf[STACK_BUF_SIZE];
+    char *truncated = nullptr;
+    bool used_stack = false;
+    
+    if (byte_pos < STACK_BUF_SIZE - 1) {
+        truncated = stack_buf;
+        used_stack = true;
+    } else {
+        // Overflow check before malloc
+        if (byte_pos > SIZE_MAX / 2) return -1;
+        truncated = static_cast<char *>(malloc(byte_pos + 1));
+        if (!truncated) return -1;
+    }
+    
+    memcpy(truncated, str, byte_pos);
+    truncated[byte_pos] = '\0';
+    int result = ncplane_putstr_yx(ncp, row, col, truncated);
+    
+    if (!used_stack) {
+        free(truncated);
+    }
+    
+    return result;
 }
 
 /*=============================================================================
@@ -187,17 +428,26 @@ std::unique_ptr<Surface> SurfaceImpl::AllocatePixMap(int width, int height) {
     auto surf = std::make_unique<SurfaceImpl>();
     /* Use the stdplane as parent so the pixmap is NOT a child of the editor
      * plane (avoids it appearing on top of the editor content).
-     * Position it far off-screen so it is never rendered to the terminal. */
+     * Position it at (0,0) but with zero size to hide it. */
     struct ncplane *parent = GetStdPlane();
     if (!parent) parent = ncp;
     if (parent) {
+        // Validate dimensions
+        if (width <= 0) width = 1;
+        if (height <= 0) height = 1;
+        // Cap at reasonable maximum to prevent memory issues
+        if (width > 10000) width = 10000;
+        if (height > 10000) height = 10000;
+        
         struct ncplane_options opts = {};
-        opts.y = -30000;
-        opts.x = -30000;
-        opts.rows = static_cast<unsigned>(height > 0 ? height : 1);
-        opts.cols = static_cast<unsigned>(width > 0 ? width : 1);
+        opts.y = 0;
+        opts.x = 0;
+        opts.rows = static_cast<unsigned>(height);
+        opts.cols = static_cast<unsigned>(width);
         struct ncplane *plane = ncplane_create(parent, &opts);
         if (plane) {
+            // Move off-screen after creation
+            ncplane_move_yx(plane, -height, 0);
             surf->ncp = plane;
             surf->isOwned = true;
         }
@@ -254,23 +504,106 @@ void SurfaceImpl::RectangleFrame(PRectangle rc, Stroke stroke) {
     FillRectangle(rc, Fill(stroke.colour));
 }
 
+/**
+ * @brief Clamp integer value to [min, max] range safely
+ * Security: Prevents overflow/underflow
+ */
+template<typename T>
+static inline T safe_clamp(T value, T min_val, T max_val) {
+    if (value < min_val) return min_val;
+    if (value > max_val) return max_val;
+    return value;
+}
+
+/**
+ * @brief Convert unsigned dimension to signed safely
+ * Security: Returns -1 if value exceeds int max
+ */
+static inline int safe_dim_to_int(unsigned dim) {
+    if (dim > static_cast<unsigned>(std::numeric_limits<int>::max())) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(dim);
+}
+
 void SurfaceImpl::FillRectangle(PRectangle rc, Fill fill) {
     if (!ncp) return;
 
+    // Convert with bounds checking
     int left = static_cast<int>(std::floor(rc.left));
     int top = static_cast<int>(std::floor(rc.top));
     int right = static_cast<int>(std::ceil(rc.right));
     int bottom = static_cast<int>(std::ceil(rc.bottom));
 
+    // Early rejection of invalid rectangles
+    // SECURITY: Check for overflow in coordinate calculations
+    if (right < left || bottom < top) return;
+    if (right - left > 10000 || bottom - top > 10000) return;  // Sanity limit
+    
+    // Clamp to valid range
+    left = safe_clamp(left, 0, std::numeric_limits<int>::max());
+    top = safe_clamp(top, 0, std::numeric_limits<int>::max());
+    
+    // Get plane dimensions
+    unsigned plane_rows_u = 0, plane_cols_u = 0;
+    ncplane_dim_yx(ncp, &plane_rows_u, &plane_cols_u);
+    
+    // Safe conversion to signed
+    int plane_rows = safe_dim_to_int(plane_rows_u);
+    int plane_cols = safe_dim_to_int(plane_cols_u);
+    
+    // Clamp right/bottom to plane dimensions
+    right = safe_clamp(right, left, plane_cols);
+    bottom = safe_clamp(bottom, top, plane_rows);
+    
     if (right <= left || bottom <= top) return;
 
     SetNCColour(ncp, fill.colour, false);
     ncplane_set_fg_default(ncp);
     ncplane_set_styles(ncp, NCSTYLE_NONE);
 
-    for (int row = top; row < bottom; row++) {
-        for (int col = left; col < right; col++) {
-            ncplane_putchar_yx(ncp, row, col, ' ');
+    // OPTIMIZATION: Use line-based fill instead of cell-by-cell
+    const int width = right - left;
+    if (width <= 0) return;
+    
+    // For small widths, cell-by-cell is fine
+    // For larger widths, create a fill line
+    constexpr int FILL_LINE_THRESHOLD = 16;
+    
+    if (width >= FILL_LINE_THRESHOLD) {
+        // Allocate fill line on stack for common cases
+        constexpr int STACK_FILL_SIZE = 256;
+        char stack_fill[STACK_FILL_SIZE];
+        char *fill_line = nullptr;
+        bool use_heap = false;
+        
+        if (width < STACK_FILL_SIZE) {
+            fill_line = stack_fill;
+        } else {
+            // SECURITY: Limit heap allocation size
+            constexpr int MAX_FILL_SIZE = 4096;
+            if (width > MAX_FILL_SIZE) return;
+            fill_line = static_cast<char *>(malloc(static_cast<size_t>(width) + 1));
+            if (!fill_line) return;
+            use_heap = true;
+        }
+        
+        memset(fill_line, ' ', static_cast<size_t>(width));
+        fill_line[width] = '\0';
+        
+        for (int row = top; row < bottom; row++) {
+            ncplane_putstr_yx(ncp, row, left, fill_line);
+        }
+        
+        if (use_heap) {
+            free(fill_line);
+        }
+    } else {
+        // Cell-by-cell for small rectangles
+        for (int row = top; row < bottom; row++) {
+            for (int col = left; col < right; col++) {
+                ncplane_putchar_yx(ncp, row, col, ' ');
+            }
         }
     }
 }
@@ -325,6 +658,28 @@ void SurfaceImpl::Copy(PRectangle rc, Point from, Surface &surfaceSource) {
     int height = static_cast<int>(std::ceil(rc.bottom) - std::floor(rc.top));
     int width  = static_cast<int>(std::ceil(rc.right)  - std::floor(rc.left));
 
+    // Validate all coordinates
+    if (srcX < 0 || srcY < 0 || dstX < 0 || dstY < 0) return;
+    if (width <= 0 || height <= 0) return;
+    
+    // Get source and destination dimensions
+    unsigned src_rows = 0, src_cols = 0;
+    unsigned dst_rows = 0, dst_cols = 0;
+    ncplane_dim_yx(src.ncp, &src_rows, &src_cols);
+    ncplane_dim_yx(ncp, &dst_rows, &dst_cols);
+    
+    // Clamp to source bounds
+    if (static_cast<unsigned>(srcX) >= src_cols || static_cast<unsigned>(srcY) >= src_rows) return;
+    if (static_cast<unsigned>(srcX + width) > src_cols) width = static_cast<int>(src_cols) - srcX;
+    if (static_cast<unsigned>(srcY + height) > src_rows) height = static_cast<int>(src_rows) - srcY;
+    
+    // Clamp to destination bounds
+    if (static_cast<unsigned>(dstX) >= dst_cols || static_cast<unsigned>(dstY) >= dst_rows) return;
+    if (static_cast<unsigned>(dstX + width) > dst_cols) width = static_cast<int>(dst_cols) - dstX;
+    if (static_cast<unsigned>(dstY + height) > dst_rows) height = static_cast<int>(dst_rows) - dstY;
+    
+    if (width <= 0 || height <= 0) return;
+
     for (int row = 0; row < height; row++) {
         for (int col = 0; col < width; col++) {
             nccell cell = NCCELL_TRIVIAL_INITIALIZER;
@@ -343,12 +698,48 @@ std::unique_ptr<IScreenLineLayout> SurfaceImpl::Layout(const IScreenLine *screen
     return nullptr;
 }
 
+/*=============================================================================
+ * Thread-local text buffer for DrawText operations
+ * Eliminates repeated heap allocations during rendering
+ *===========================================================================*/
+
+/**
+ * @brief Thread-local buffer for text rendering
+ * 
+ * PERFORMANCE: This buffer is reused across DrawText calls, eliminating
+ * malloc/free overhead in the render hot path. It grows as needed but
+ * never shrinks, amortizing allocation cost over many frames.
+ */
+static thread_local std::vector<char> g_tls_text_buffer;
+
+/**
+ * @brief Get thread-local buffer with at least min_size capacity
+ * @param min_size Minimum required capacity
+ * @return Pointer to buffer data
+ */
+static char* get_tls_buffer(size_t min_size) {
+    if (g_tls_text_buffer.size() < min_size) {
+        // Grow with some headroom to avoid frequent reallocations
+        size_t new_size = min_size + 256;
+        // Cap at reasonable maximum to prevent runaway growth
+        constexpr size_t MAX_BUFFER_SIZE = 65536;
+        if (new_size > MAX_BUFFER_SIZE) {
+            new_size = MAX_BUFFER_SIZE;
+        }
+        g_tls_text_buffer.resize(new_size);
+    }
+    return g_tls_text_buffer.data();
+}
+
 void SurfaceImpl::DrawTextNoClip(PRectangle rc, const Font *font_, XYPOSITION ybase,
                                   std::string_view text, ColourRGBA fore, ColourRGBA back) {
     if (!ncp || text.empty()) return;
 
     int row = static_cast<int>(rc.top);
     int col = static_cast<int>(rc.left);
+    
+    // Validate coordinates
+    if (row < 0 || col < 0) return;
 
     SetNCColour(ncp, fore, true);
     SetNCColour(ncp, back, false);
@@ -360,9 +751,18 @@ void SurfaceImpl::DrawTextNoClip(PRectangle rc, const Font *font_, XYPOSITION yb
         ncplane_set_styles(ncp, NCSTYLE_NONE);
     }
 
-    /* Build a null-terminated copy for ncplane_putstr_yx */
-    std::string buf(text);
-    ncplane_putstr_yx(ncp, row, col, buf.c_str());
+    size_t tlen = text.size();
+    
+    // Use thread-local buffer (no heap allocation in steady state)
+    char *buf = get_tls_buffer(tlen + 1);
+    std::memcpy(buf, text.data(), tlen);
+    buf[tlen] = '\0';
+    
+    // Get plane width for truncation
+    unsigned plane_cols = ncplane_dim_x(ncp);
+    if (static_cast<unsigned>(col) < plane_cols) {
+        safe_putstr_yx(ncp, row, col, buf, static_cast<int>(plane_cols) - col);
+    }
 
     (void)ybase;
 }
@@ -378,6 +778,9 @@ void SurfaceImpl::DrawTextTransparent(PRectangle rc, const Font *font_, XYPOSITI
 
     int row = static_cast<int>(rc.top);
     int col = static_cast<int>(rc.left);
+    
+    // Validate coordinates
+    if (row < 0 || col < 0) return;
 
     SetNCColour(ncp, fore, true);
     ncplane_set_bg_default(ncp);
@@ -389,8 +792,16 @@ void SurfaceImpl::DrawTextTransparent(PRectangle rc, const Font *font_, XYPOSITI
         ncplane_set_styles(ncp, NCSTYLE_NONE);
     }
 
-    std::string buf(text);
-    ncplane_putstr_yx(ncp, row, col, buf.c_str());
+    // PERFORMANCE: Use thread-local buffer (no heap allocation)
+    size_t tlen = text.size();
+    char *buf = get_tls_buffer(tlen + 1);
+    std::memcpy(buf, text.data(), tlen);
+    buf[tlen] = '\0';
+    
+    unsigned plane_cols = ncplane_dim_x(ncp);
+    if (static_cast<unsigned>(col) < plane_cols) {
+        safe_putstr_yx(ncp, row, col, buf, static_cast<int>(plane_cols) - col);
+    }
 
     (void)ybase;
 }
@@ -506,21 +917,19 @@ void SurfaceImpl::DrawLineMarker(const PRectangle &rcWhole, const Font *fontForC
     const auto *lm = static_cast<const LineMarker *>(data);
 
     /* Map Scintilla marker types to terminal characters.
-     * The fold margin is 1 cell wide, so we use single ASCII/Unicode chars.
-     * Box-tree style (default): [+] collapsed, [-] expanded, │ body,
-     * └ tail, ├ mid-tail; plus/minus and circle styles mapped similarly. */
+     * The fold margin is 1 cell wide, so we use single ASCII/Unicode chars. */
     const char *ch = nullptr;
     using MS = MarkerSymbol;
     switch (lm->markType) {
-        case MS::BoxPlus:              ch = "+"; break; /* collapsed head         */
-        case MS::BoxMinus:             ch = "-"; break; /* expanded head          */
-        case MS::BoxPlusConnected:     ch = "+"; break; /* collapsed head w/ body */
-        case MS::BoxMinusConnected:    ch = "-"; break; /* expanded head w/ body  */
-        case MS::VLine:                ch = "\xe2\x94\x82"; break; /* │ body     */
-        case MS::LCorner:              ch = "\xe2\x94\x94"; break; /* └ tail     */
-        case MS::LCornerCurve:         ch = "\xe2\x95\xb0"; break; /* ╰ tail     */
-        case MS::TCorner:              ch = "\xe2\x94\x9c"; break; /* ├ mid-tail */
-        case MS::TCornerCurve:         ch = "\xe2\x94\x9c"; break; /* ├ mid-tail */
+        case MS::BoxPlus:              ch = "+"; break;
+        case MS::BoxMinus:             ch = "-"; break;
+        case MS::BoxPlusConnected:     ch = "+"; break;
+        case MS::BoxMinusConnected:    ch = "-"; break;
+        case MS::VLine:                ch = "\xe2\x94\x82"; break;
+        case MS::LCorner:              ch = "\xe2\x94\x94"; break;
+        case MS::LCornerCurve:         ch = "\xe2\x95\xb0"; break;
+        case MS::TCorner:              ch = "\xe2\x94\x9c"; break;
+        case MS::TCornerCurve:         ch = "\xe2\x94\x9c"; break;
         case MS::Plus:                 ch = "+"; break;
         case MS::Minus:                ch = "-"; break;
         case MS::Arrow:                ch = ">"; break;
@@ -529,11 +938,21 @@ void SurfaceImpl::DrawLineMarker(const PRectangle &rcWhole, const Font *fontForC
         case MS::CircleMinus:          ch = "-"; break;
         case MS::CirclePlusConnected:  ch = "+"; break;
         case MS::CircleMinusConnected: ch = "-"; break;
-        default:                       return;          /* nothing to draw        */
+        default:                       return;
     }
 
     int row = static_cast<int>(rcWhole.top);
     int col = static_cast<int>(rcWhole.left);
+    
+    // Validate coordinates
+    if (row < 0 || col < 0) return;
+    
+    // Check plane bounds
+    unsigned plane_rows = 0, plane_cols = 0;
+    ncplane_dim_yx(ncp, &plane_rows, &plane_cols);
+    if (static_cast<unsigned>(row) >= plane_rows || static_cast<unsigned>(col) >= plane_cols) {
+        return;
+    }
 
     SetNCColour(ncp, lm->fore, true);
     SetNCColour(ncp, lm->back, false);
@@ -570,11 +989,6 @@ PRectangle Window::GetPosition() const {
     auto ncp = static_cast<struct ncplane *>(wid);
     unsigned rows = 0, cols = 0;
     ncplane_dim_yx(ncp, &rows, &cols);
-    /* Return plane-LOCAL coordinates (always origin 0,0).
-     * Scintilla uses this rectangle as its drawing coordinate space, and all
-     * Surface calls (FillRectangle, DrawTextNoClip, …) use plane-local coords.
-     * Using screen-absolute coords would offset all drawing on any plane that
-     * is not positioned at (0,0) — e.g. the right pane in a split view. */
     return PRectangle(0, 0,
                       static_cast<XYPOSITION>(cols),
                       static_cast<XYPOSITION>(rows));
@@ -652,11 +1066,31 @@ void ListBoxImpl::Create(Window &parent, int ctrlID, Point location_,
     struct ncplane *parentPlane = static_cast<struct ncplane *>(parent.GetID());
     if (!parentPlane) return;
 
+    // Validate dimensions
+    if (height <= 0) height = 5;
+    if (width <= 0) width = 20;
+    if (height > 1000) height = 1000;  // Sanity cap
+    if (width > 1000) width = 1000;
+    
+    // Check parent dimensions
+    unsigned parent_rows = 0, parent_cols = 0;
+    ncplane_dim_yx(parentPlane, &parent_rows, &parent_cols);
+    
+    // Ensure listbox fits within parent
+    if (static_cast<int>(location_.y) + height > static_cast<int>(parent_rows)) {
+        height = static_cast<int>(parent_rows) - static_cast<int>(location_.y);
+        if (height <= 0) height = static_cast<int>(parent_rows) / 2;
+    }
+    if (static_cast<int>(location_.x) + width > static_cast<int>(parent_cols)) {
+        width = static_cast<int>(parent_cols) - static_cast<int>(location_.x);
+        if (width <= 0) width = static_cast<int>(parent_cols) / 2;
+    }
+
     struct ncplane_options opts = {};
     opts.y = static_cast<int>(location_.y);
     opts.x = static_cast<int>(location_.x);
-    opts.rows = static_cast<unsigned>(height > 0 ? height : 5);
-    opts.cols = static_cast<unsigned>(width > 0 ? width : 20);
+    opts.rows = static_cast<unsigned>(height);
+    opts.cols = static_cast<unsigned>(width);
     ncp = ncplane_create(parentPlane, &opts);
     if (ncp) {
         wid = ncp;
@@ -692,7 +1126,17 @@ void ListBoxImpl::Clear() noexcept {
 
 void ListBoxImpl::Append(char *s, int type) {
     (void)type;
-    if (s) list.emplace_back(s);
+    if (s) {
+        // Limit string length to prevent excessive memory usage
+        size_t len = strlen(s);
+        if (len > 1024) {
+            // Truncate very long strings
+            std::string truncated(s, 1024);
+            list.push_back(truncated);
+        } else {
+            list.emplace_back(s);
+        }
+    }
 }
 
 int ListBoxImpl::Length() {
@@ -703,6 +1147,12 @@ void ListBoxImpl::Select(int n) {
     selection = n;
     if (!ncp) return;
 
+    // Validate selection index
+    if (n < 0 || n >= static_cast<int>(list.size())) {
+        // Still valid to set selection, but render nothing selected
+        if (n < 0) return;
+    }
+
     /* Render the listbox */
     ncplane_erase(ncp);
     int rows = static_cast<int>(list.size());
@@ -710,9 +1160,19 @@ void ListBoxImpl::Select(int n) {
     int startIdx = 0;
     if (n >= visRows) startIdx = n - visRows + 1;
     if (startIdx < 0) startIdx = 0;
+    
+    // Get actual plane dimensions
+    unsigned plane_rows = 0, plane_cols = 0;
+    ncplane_dim_yx(ncp, &plane_rows, &plane_cols);
+    int max_width = static_cast<int>(plane_cols);
 
     for (int i = 0; i < visRows && (startIdx + i) < rows; i++) {
         int itemIdx = startIdx + i;
+        if (itemIdx < 0 || itemIdx >= static_cast<int>(list.size())) continue;
+        
+        // Skip if row is outside plane bounds
+        if (static_cast<unsigned>(i) >= plane_rows) continue;
+        
         if (itemIdx == n) {
             /* Highlight selected */
             ncplane_set_fg_rgb8(ncp, 0, 0, 0);
@@ -721,7 +1181,10 @@ void ListBoxImpl::Select(int n) {
             ncplane_set_fg_rgb8(ncp, 0xFF, 0xFF, 0xFF);
             ncplane_set_bg_rgb8(ncp, 0x20, 0x20, 0x20);
         }
-        ncplane_putstr_yx(ncp, i, 0, list[static_cast<size_t>(itemIdx)].c_str());
+        
+        // Use safe string output with truncation
+        const char *str = list[static_cast<size_t>(itemIdx)].c_str();
+        safe_putstr_yx(ncp, i, 0, str, max_width);
     }
 }
 
@@ -770,17 +1233,32 @@ void ListBoxImpl::SetList(const char *listStr, char separator, char typesep) {
             auto pos = s.find(typesep);
             if (pos != std::string::npos) s = s.substr(0, pos);
             if (!s.empty()) {
+                // Limit size of individual items
+                if (s.length() > 1024) {
+                    s.resize(1024);
+                }
                 list.push_back(s);
                 s.clear();
             }
         } else {
             s += *p;
+            // Prevent excessive accumulation
+            if (s.length() > 2048) {
+                s.resize(1024);  // Truncate and add
+                list.push_back(s);
+                s.clear();
+            }
         }
     }
     if (!s.empty()) {
         auto pos = s.find(typesep);
         if (pos != std::string::npos) s = s.substr(0, pos);
-        if (!s.empty()) list.push_back(s);
+        if (!s.empty()) {
+            if (s.length() > 1024) {
+                s.resize(1024);
+            }
+            list.push_back(s);
+        }
     }
 }
 

@@ -16,6 +16,76 @@
 #define IMAGE_MAX 31
 #endif
 
+/*=============================================================================
+ * Per-frame arena allocator
+ *
+ * A bump-pointer allocator that eliminates malloc/free overhead in the render
+ * hot path.  The arena is reset once at the top of each Render() call, so all
+ * per-frame scratch memory is reclaimed in O(1) without touching the heap.
+ *
+ * Default capacity is 1 MB.  Override before including this header:
+ *   #define SCINTERM_ARENA_SIZE (2 * 1024 * 1024)
+ *===========================================================================*/
+
+/*=============================================================================
+ * Configurable compile-time constants
+ *
+ * Override any of these by defining them before including this header or via
+ * a compiler flag (e.g. -DSCINTERM_TARGET_FPS=30).
+ *===========================================================================*/
+
+#ifndef SCINTERM_ARENA_SIZE
+#define SCINTERM_ARENA_SIZE (1024u * 1024u)   /* 1 MB per-frame scratch arena */
+#endif
+
+#ifndef SCINTERM_TARGET_FPS
+#define SCINTERM_TARGET_FPS 60                /* maximum rendered frames per second */
+#endif
+
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+
+struct Arena {
+    char  *buf;
+    size_t pos;
+    size_t cap;
+};
+
+/** One-time initialisation.  Allocates the backing buffer from the heap.
+ *  Returns true on success; the arena is left inert (cap==0) on failure. */
+static inline bool arena_init(Arena *a, size_t cap) {
+    a->buf = static_cast<char *>(std::malloc(cap));
+    a->pos = 0;
+    a->cap = a->buf ? cap : 0u;
+    return a->buf != nullptr;
+}
+
+/** Free the backing buffer and zero the arena descriptor. */
+static inline void arena_free(Arena *a) {
+    std::free(a->buf);
+    a->buf = nullptr;
+    a->pos = a->cap = 0u;
+}
+
+/** Reset the arena to empty — O(1), no heap traffic. */
+static inline void arena_reset(Arena *a) {
+    a->pos = 0u;
+}
+
+/** Bump-allocate `size` bytes (pointer-aligned).
+ *  Returns nullptr when the arena is exhausted; callers must handle this. */
+static inline void *arena_alloc(Arena *a, size_t size) {
+    constexpr size_t kAlign = sizeof(void *);
+    size = (size + kAlign - 1u) & ~(kAlign - 1u);   /* round up */
+    if (!a->buf || a->pos + size > a->cap)
+        return nullptr;
+    void *ptr = a->buf + a->pos;
+    a->pos += size;
+    return ptr;
+}
+
 #include <notcurses/notcurses.h>
 #include "Platform.h"
 #include "Geometry.h"
@@ -25,6 +95,21 @@
 #include <string>
 
 namespace Scintilla::Internal {
+
+/*=============================================================================
+ * Global render-frame arena
+ *
+ * Defined in scinterm_plat.cpp.  Reset by ScintillaNotCurses::Render() once
+ * per frame before the Scintilla paint pass begins.
+ * 
+ * THREAD SAFETY: The arena is protected by an internal mutex. All access
+ * from ScintillaNotCurses::Render() is thread-safe. Direct access to
+ * g_render_arena should only be done through arena_alloc_safe() and
+ * arena_reset_safe() functions defined in the .cpp file.
+ *===========================================================================*/
+
+extern Arena g_render_arena;
+extern std::mutex g_arena_mutex;
 
 /*=============================================================================
  * Forward declarations
@@ -40,9 +125,12 @@ class ListBoxImpl;
 
 /**
  * @brief Initialize the global NotCurses context.
+ *
+ * @param extra_ncopts  Additional NCOPTION_* flags OR-ed into the base flags.
+ *                      Pass 0 for default behaviour.
  * @return true if successful, false otherwise.
  */
-bool InitNotCurses();
+bool InitNotCurses(uint64_t extra_ncopts = 0);
 
 /**
  * @brief Shut down the global NotCurses context.

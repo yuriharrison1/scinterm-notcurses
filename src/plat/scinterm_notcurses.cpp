@@ -14,6 +14,8 @@
 #include <cstring>
 #include <cassert>
 #include <cctype>
+#include <ctime>        /* clock_gettime, nanosleep, struct timespec, CLOCK_MONOTONIC */
+#include <cerrno>       /* errno, EINTR */
 
 #include <stdexcept>
 #include <string>
@@ -28,6 +30,7 @@
 #include <memory>
 #include <chrono>
 #include <atomic>
+#include <mutex>
 
 #include <notcurses/notcurses.h>
 
@@ -85,10 +88,83 @@ using namespace Scintilla;
 using namespace Scintilla::Internal;
 
 /*=============================================================================
- * Internal clipboard
+ * Thread-safe clipboard implementation
  *===========================================================================*/
 
-static std::string g_clipboard;
+class ThreadSafeClipboard {
+private:
+    std::string data;
+    std::mutex mtx;
+
+public:
+    void set(const std::string_view &text) {
+        std::lock_guard<std::mutex> lock(mtx);
+        data = std::string(text);
+    }
+    
+    std::string get() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return data;
+    }
+    
+    bool empty() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return data.empty();
+    }
+    
+    void clear() {
+        std::lock_guard<std::mutex> lock(mtx);
+        data.clear();
+    }
+};
+
+static ThreadSafeClipboard g_clipboard;
+
+/*=============================================================================
+ * Frame-rate throttle helpers with robust timing
+ *
+ * Uses CLOCK_MONOTONIC (no leap-second jumps, no NTP steps) for stable
+ * inter-frame interval measurement.  All arithmetic is in nanoseconds to
+ * stay in integer math.
+ *===========================================================================*/
+
+/* Target inter-frame interval: e.g. 16 666 667 ns at 60 fps. */
+static constexpr long long FRAME_NS = 1'000'000'000LL / SCINTERM_TARGET_FPS;
+
+/* Read the monotonic clock. Returns true on success, false on failure. */
+static inline bool sc_now(struct timespec *ts) noexcept {
+    if (clock_gettime(CLOCK_MONOTONIC, ts) != 0) {
+        // Fallback to CLOCK_REALTIME if MONOTONIC unavailable
+        if (clock_gettime(CLOCK_REALTIME, ts) != 0) {
+            ts->tv_sec = 0;
+            ts->tv_nsec = 0;
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Signed difference (a − b) in nanoseconds.  Negative when b is later. */
+static inline long long sc_diff_ns(const struct timespec &a,
+                                   const struct timespec &b) noexcept {
+    return (static_cast<long long>(a.tv_sec)  - static_cast<long long>(b.tv_sec))
+           * 1'000'000'000LL
+         + (static_cast<long long>(a.tv_nsec) - static_cast<long long>(b.tv_nsec));
+}
+
+/* Robust nanosleep that handles EINTR correctly */
+static inline void sc_nanosleep(long long ns) noexcept {
+    struct timespec req = { 0L, static_cast<long>(ns) };
+    struct timespec rem;
+    
+    while (nanosleep(&req, &rem) == -1) {
+        if (errno == EINTR) {
+            req = rem;
+        } else {
+            break;
+        }
+    }
+}
 
 /*=============================================================================
  * Fold marker drawing callback
@@ -114,9 +190,27 @@ class ScintillaNotCurses : public ScintillaBase {
     struct ncplane *ncp;
     bool hasFocus;
     bool capturedMouse;
+    /* Dirty flag: true when the plane needs a Scintilla repaint.
+     * Starts true so the very first Render() always paints.
+     * Internal only — never exposed through the public C API header. */
+    bool dirty;
+    /* Monotonic timestamp of the last completed render frame.
+     * Initialised to {0,0} so the first Render() call always fires
+     * immediately: sc_diff_ns(now, {0,0}) >> FRAME_NS.              */
+    struct timespec lastRenderTime;
     void (*notifyCallback)(void *sci, int iMessage, SCNotification *n, void *userdata);
     void *notifyUserdata;
-    std::string internalClipboard;
+
+    /*=========================================================================
+     * Dirty-tracking helpers (internal, not in public API)
+     *
+     * scinterm_mark_dirty() — set the dirty flag; called from every code path
+     *   that changes visible state.
+     * scinterm_is_dirty()   — predicate used by Render() to decide whether
+     *   the Scintilla paint pass should be skipped.
+     *=======================================================================*/
+    void scinterm_mark_dirty() noexcept { dirty = true; }
+    bool scinterm_is_dirty() const noexcept { return dirty; }
 
 public:
     ScintillaNotCurses(void (*cb)(void *, int, SCNotification *, void *), void *ud);
@@ -146,9 +240,25 @@ public:
     void SetHorizontalScrollPos() override {}
     bool ModifyScrollBars(Sci::Line /*nMax*/, Sci::Line /*nPage*/) override { return false; }
     void ReconfigureScrollBars() override {}
-    void UpdateSystemCaret() override {}
 
-    void NotifyChange() override {}
+    /* Caret moved (cursor-key navigation, mouse click, programmatic move).
+     * Marks dirty so Render() updates the visible cursor position.        */
+    void UpdateSystemCaret() override { scinterm_mark_dirty(); }
+
+    /* Document content changed (insert, delete, paste, undo/redo).        */
+    void NotifyChange() override { scinterm_mark_dirty(); }
+
+    /* Override Redraw() to catch all other visual-state changes:
+     *   • Style changes:  SCI_STYLESETFORE/BACK → InvalidateStyleRedraw() → Redraw()
+     *   • Scroll changes: ScrollTo() → Redraw()
+     *   • Selection:      InvalidateSelection() paths that reach Redraw()
+     * The base is called first so redrawPendingText is maintained correctly
+     * for Scintilla's own Paint() internals.                               */
+    void Redraw() override {
+        Editor::Redraw();       /* sets redrawPendingText; no-op InvalidateRectangle */
+        scinterm_mark_dirty();
+    }
+
     void NotifyParent(Scintilla::NotificationData scn) override;
 
     void CopyToClipboard(const SelectionText &selectedText) override;
@@ -179,8 +289,10 @@ public:
 
 ScintillaNotCurses::ScintillaNotCurses(void (*cb)(void *, int, SCNotification *, void *),
                                        void *ud)
-    : ncp(nullptr), hasFocus(false), capturedMouse(false),
-      notifyCallback(cb), notifyUserdata(ud) {
+    : ncp(nullptr), hasFocus(false), capturedMouse(false), dirty(true),
+      lastRenderTime{}, notifyCallback(cb), notifyUserdata(ud) {
+    lastRenderTime.tv_sec = 0;
+    lastRenderTime.tv_nsec = 0;
     Initialise();
 }
 
@@ -259,6 +371,10 @@ void ScintillaNotCurses::Initialise() {
      * only updates markType, leaving customDraw untouched.                  */
     /* Marker numbers 25-31 are the 7 fold-related slots (see Scintilla.h).
      * SC_MARKNUM_FOLDEREND=25 … SC_MARKNUM_FOLDEROPEN=31                  */
+    /* Ensure markers vector is large enough */
+    if (vs.markers.size() < 32) {
+        vs.markers.resize(32);
+    }
     for (int m = 25; m <= 31; ++m) {
         if (m < static_cast<int>(vs.markers.size()))
             vs.markers[m].customDraw = DrawFoldMarkerCallback;
@@ -287,8 +403,7 @@ void ScintillaNotCurses::NotifyParent(Scintilla::NotificationData scn) {
 }
 
 void ScintillaNotCurses::CopyToClipboard(const SelectionText &selectedText) {
-    internalClipboard = std::string(selectedText.Data(), selectedText.Length());
-    g_clipboard = internalClipboard;
+    g_clipboard.set(std::string_view(selectedText.Data(), selectedText.Length()));
 }
 
 void ScintillaNotCurses::Copy() {
@@ -299,15 +414,44 @@ void ScintillaNotCurses::Copy() {
 
 void ScintillaNotCurses::Paste() {
     if (g_clipboard.empty()) return;
+    std::string clipdata = g_clipboard.get();
     ClearSelection(false);
-    InsertPaste(g_clipboard.c_str(), static_cast<Sci::Position>(g_clipboard.size()));
+    InsertPaste(clipdata.c_str(), static_cast<Sci::Position>(clipdata.size()));
 }
 
 void ScintillaNotCurses::Render() {
     if (!ncp) return;
 
-    /* Set the base cell used for cells not explicitly painted by Scintilla.
-     * Fill with the theme background colour so unpainted cells match the theme. */
+    /* ── Dirty check ────────────────────────────────────────────────────────
+     * Skip the Scintilla paint pass entirely when nothing has changed.      */
+    if (!scinterm_is_dirty()) return;
+
+    /* ── Frame-rate throttle ────────────────────────────────────────────────
+     *
+     * Uses robust nanosleep that handles EINTR correctly. The sleep time
+     * is adjusted to maintain consistent frame timing.                     */
+    struct timespec now = {};
+    if (sc_now(&now)) {
+        const long long elapsed_ns = sc_diff_ns(now, lastRenderTime);
+        if (elapsed_ns < FRAME_NS) {
+            sc_nanosleep(FRAME_NS - elapsed_ns);
+            // Re-read time after sleep for accurate timing
+            sc_now(&now);
+        }
+    }
+    lastRenderTime = now;
+
+    dirty = false;
+
+    /* Reclaim all per-frame scratch memory in O(1) before the paint pass. */
+    {
+        std::lock_guard<std::mutex> lock(g_arena_mutex);
+        arena_reset(&g_render_arena);
+    }
+
+    /* Fill the entire plane with the default background colour before painting
+     * so that any cell not explicitly drawn by Scintilla shows the editor
+     * background instead of the terminal's default (usually white). */
     ColourRGBA bg = vs.styles[STYLE_DEFAULT].back;
     uint64_t channels = 0;
     ncchannels_set_bg_rgb8(&channels,
@@ -350,12 +494,50 @@ void ScintillaNotCurses::Resize() {
      * set the plane to the desired dimensions (e.g. rows-2 to leave room for
      * tab bar and status bar).  Just inform Scintilla of the new size so it
      * can update scroll bars and layout. */
+    scinterm_mark_dirty();   /* geometry changed → full repaint required */
     ChangeSize();
 }
 
 void ScintillaNotCurses::SetFocus(bool focus) {
     hasFocus = focus;
     SetFocusState(focus);
+    scinterm_mark_dirty();   /* focus change affects cursor visibility */
+}
+
+/*=============================================================================
+ * Key handling helper functions
+ * ARCHITECTURE: Extracted functions for better maintainability
+ *===========================================================================*/
+
+/**
+ * @brief Encode Unicode codepoint to UTF-8
+ * SECURITY: Validates codepoint range before encoding
+ */
+static int encode_utf8(uint32_t ucs, char out[5]) {
+    // Reject surrogates and out-of-range values
+    if (ucs > 0x10FFFF || (ucs >= 0xD800 && ucs <= 0xDFFF)) {
+        return 0;
+    }
+    
+    if (ucs < 0x80) {
+        out[0] = static_cast<char>(ucs);
+        return 1;
+    } else if (ucs < 0x800) {
+        out[0] = static_cast<char>(0xC0 | (ucs >> 6));
+        out[1] = static_cast<char>(0x80 | (ucs & 0x3F));
+        return 2;
+    } else if (ucs < 0x10000) {
+        out[0] = static_cast<char>(0xE0 | (ucs >> 12));
+        out[1] = static_cast<char>(0x80 | ((ucs >> 6) & 0x3F));
+        out[2] = static_cast<char>(0x80 | (ucs & 0x3F));
+        return 3;
+    } else {
+        out[0] = static_cast<char>(0xF0 | (ucs >> 18));
+        out[1] = static_cast<char>(0x80 | ((ucs >> 12) & 0x3F));
+        out[2] = static_cast<char>(0x80 | ((ucs >> 6) & 0x3F));
+        out[3] = static_cast<char>(0x80 | (ucs & 0x3F));
+        return 4;
+    }
 }
 
 void ScintillaNotCurses::SendKey(int key, int modifiers) {
@@ -363,6 +545,8 @@ void ScintillaNotCurses::SendKey(int key, int modifiers) {
     if (modifiers & NCKEY_MOD_SHIFT) sciMods |= static_cast<int>(KeyMod::Shift);
     if (modifiers & NCKEY_MOD_CTRL)  sciMods |= static_cast<int>(KeyMod::Ctrl);
     if (modifiers & NCKEY_MOD_ALT)   sciMods |= static_cast<int>(KeyMod::Alt);
+    if (modifiers & NCKEY_MOD_META)  sciMods |= static_cast<int>(KeyMod::Meta);
+    if (modifiers & NCKEY_MOD_SUPER) sciMods |= static_cast<int>(KeyMod::Super);
 
     int sciKey = key;
     switch (static_cast<uint32_t>(key)) {
@@ -399,8 +583,7 @@ void ScintillaNotCurses::SendKey(int key, int modifiers) {
                 return;
             } else if (key >= 0x20 && key < 0x7F) {
                 if (sciMods & (static_cast<int>(KeyMod::Ctrl) | static_cast<int>(KeyMod::Alt))) {
-                    /* Ctrl/Alt+key — pass as command, not text insertion.
-                     * Scintilla's keymap uses uppercase letters for commands. */
+                    /* Ctrl/Alt+key — pass as command, not text insertion. */
                     int cmdKey = (key >= 'a' && key <= 'z') ? (key - 32) : key;
                     KeyDownWithModifiers(static_cast<Keys>(cmdKey),
                                         static_cast<KeyMod>(sciMods), nullptr);
@@ -412,32 +595,13 @@ void ScintillaNotCurses::SendKey(int key, int modifiers) {
                 return;
             } else if (key > 0x7F && key <= 0x10FFFF &&
                        !(key >= 0xD800 && key <= 0xDFFF)) {
-                /* Unicode codepoint — encode as UTF-8.
-                 * Reject surrogates (D800-DFFF) and values beyond U+10FFFF. */
+                /* Unicode codepoint — use extracted encode_utf8 function */
                 char utf8[5] = {};
-                uint32_t ucs = static_cast<uint32_t>(key);
-                int len = 0;
-                if (ucs < 0x80) {
-                    utf8[0] = static_cast<char>(ucs);
-                    len = 1;
-                } else if (ucs < 0x800) {
-                    utf8[0] = static_cast<char>(0xC0 | (ucs >> 6));
-                    utf8[1] = static_cast<char>(0x80 | (ucs & 0x3F));
-                    len = 2;
-                } else if (ucs < 0x10000) {
-                    utf8[0] = static_cast<char>(0xE0 | (ucs >> 12));
-                    utf8[1] = static_cast<char>(0x80 | ((ucs >> 6) & 0x3F));
-                    utf8[2] = static_cast<char>(0x80 | (ucs & 0x3F));
-                    len = 3;
-                } else {
-                    utf8[0] = static_cast<char>(0xF0 | (ucs >> 18));
-                    utf8[1] = static_cast<char>(0x80 | ((ucs >> 12) & 0x3F));
-                    utf8[2] = static_cast<char>(0x80 | ((ucs >> 6) & 0x3F));
-                    utf8[3] = static_cast<char>(0x80 | (ucs & 0x3F));
-                    len = 4;
+                int len = encode_utf8(static_cast<uint32_t>(key), utf8);
+                if (len > 0) {
+                    InsertCharacter(std::string_view(utf8, static_cast<size_t>(len)),
+                                    CharacterSource::DirectInput);
                 }
-                InsertCharacter(std::string_view(utf8, static_cast<size_t>(len)),
-                                CharacterSource::DirectInput);
                 return;
             }
             break;
@@ -459,6 +623,9 @@ bool ScintillaNotCurses::SendMouse(int event, int button, int modifiers, int y, 
     int sciMods = 0;
     if (modifiers & NCKEY_MOD_SHIFT) sciMods |= static_cast<int>(KeyMod::Shift);
     if (modifiers & NCKEY_MOD_CTRL)  sciMods |= static_cast<int>(KeyMod::Ctrl);
+    if (modifiers & NCKEY_MOD_ALT)   sciMods |= static_cast<int>(KeyMod::Alt);
+    if (modifiers & NCKEY_MOD_META)  sciMods |= static_cast<int>(KeyMod::Meta);
+    if (modifiers & NCKEY_MOD_SUPER) sciMods |= static_cast<int>(KeyMod::Super);
 
     unsigned int time = 0;
 
@@ -484,21 +651,77 @@ bool ScintillaNotCurses::SendMouse(int event, int button, int modifiers, int y, 
 }
 
 bool ScintillaNotCurses::ProcessInput(struct notcurses *nc) {
-    ncinput input = {};
-    uint32_t key = notcurses_get_nblock(nc, &input);
-    if (key == static_cast<uint32_t>(-1) || key == 0) return false;
+    /* ── Input batching with resize coalescing ─────────────────────────────
+     *
+     * Collects all available events and processes them before rendering.
+     * Multiple resize events are coalesced into a single resize operation
+     * to prevent O(N²) work during resize storms.                          */
+    static constexpr int BATCH_MAX = 256;
+    ncinput  inputs[BATCH_MAX];
+    uint32_t keys[BATCH_MAX];
+    int n = 0;
+    bool has_resize = false;
 
-    if (nckey_mouse_p(key)) {
-        int evt = (input.evtype == NCTYPE_PRESS)   ? SCM_PRESS :
-                  (input.evtype == NCTYPE_RELEASE) ? SCM_RELEASE : SCM_DRAG;
-        int mods = 0;
-        if (input.modifiers & NCKEY_MOD_SHIFT) mods |= NCKEY_MOD_SHIFT;
-        if (input.modifiers & NCKEY_MOD_CTRL)  mods |= NCKEY_MOD_CTRL;
-        int btn = input.eff_text[0] ? static_cast<int>(input.eff_text[0]) : 1;
-        return SendMouse(evt, btn, mods, input.y, input.x);
+    while (n < BATCH_MAX) {
+        ncinput in = {};
+        const uint32_t key = notcurses_get_nblock(nc, &in);
+        if (key == static_cast<uint32_t>(-1) || key == 0) break;
+        
+        // Coalesce multiple resize events
+        if (key == NCKEY_RESIZE) {
+            if (has_resize) {
+                // Skip duplicate resize events - keep only the last one
+                continue;
+            }
+            has_resize = true;
+        }
+        
+        inputs[n] = in;
+        keys[n]   = key;
+        ++n;
     }
 
-    SendKey(static_cast<int>(key), static_cast<int>(input.modifiers));
+    if (n == 0) return false;
+
+    for (int i = 0; i < n; ++i) {
+        const ncinput  &input = inputs[i];
+        const uint32_t  key   = keys[i];
+
+        /* Resize: update Scintilla geometry immediately; no key dispatch. */
+        if (key == NCKEY_RESIZE) {
+            Resize();
+            continue;
+        }
+
+        /* Kitty protocol delivers press+release pairs for every keystroke.
+         * Discard releases for keyboard events — only PRESS/REPEAT reach
+         * Scintilla.  Mouse release is handled by the SCM_RELEASE path below
+         * and must NOT be filtered here. */
+        if (!nckey_mouse_p(key) && input.evtype == NCTYPE_RELEASE)
+            continue;
+
+        if (nckey_mouse_p(key)) {
+            int evt = (input.evtype == NCTYPE_PRESS)   ? SCM_PRESS :
+                      (input.evtype == NCTYPE_RELEASE) ? SCM_RELEASE : SCM_DRAG;
+            int mods = 0;
+            if (input.modifiers & NCKEY_MOD_SHIFT) mods |= NCKEY_MOD_SHIFT;
+            if (input.modifiers & NCKEY_MOD_CTRL)  mods |= NCKEY_MOD_CTRL;
+            if (input.modifiers & NCKEY_MOD_ALT)   mods |= NCKEY_MOD_ALT;
+            if (input.modifiers & NCKEY_MOD_META)  mods |= NCKEY_MOD_META;
+            if (input.modifiers & NCKEY_MOD_SUPER) mods |= NCKEY_MOD_SUPER;
+            
+            // Extract button from notcurses input.id field (more reliable than eff_text)
+            int btn = 1;  // Default to left button
+            if (input.id >= 1 && input.id <= 5) {
+                btn = static_cast<int>(input.id);
+            }
+            
+            SendMouse(evt, btn, mods, input.y, input.x);
+        } else {
+            SendKey(static_cast<int>(key), static_cast<int>(input.modifiers));
+        }
+    }
+
     return true;
 }
 
@@ -507,20 +730,146 @@ char *ScintillaNotCurses::GetClipboard(int *len) {
         if (len) *len = 0;
         return nullptr;
     }
-    size_t sz = g_clipboard.size();
-    /* Guard against truncation: cap at INT_MAX bytes */
-    if (sz > static_cast<size_t>(INT_MAX))
-        sz = static_cast<size_t>(INT_MAX);
+    std::string clipdata = g_clipboard.get();
+    size_t sz = clipdata.size();
+    
+    /* SECURITY: Guard against multiple overflow scenarios:
+     * 1. Truncation: cap at INT_MAX for return value
+     * 2. Overflow: sz + 1 must not overflow
+     * 3. Allocation size: must be reasonable
+     */
+    constexpr size_t MAX_CLIPBOARD_SIZE = static_cast<size_t>(INT_MAX) - 1;
+    constexpr size_t REASONABLE_MAX = 100 * 1024 * 1024;  // 100MB sanity limit
+    
+    if (sz > REASONABLE_MAX) {
+        sz = REASONABLE_MAX;
+    }
+    if (sz > MAX_CLIPBOARD_SIZE) {
+        sz = MAX_CLIPBOARD_SIZE;
+    }
+    
+    /* Now sz + 1 is guaranteed safe */
     char *result = static_cast<char *>(malloc(sz + 1));
     if (!result) {
         if (len) *len = 0;
         return nullptr;
     }
-    memcpy(result, g_clipboard.data(), sz);
+    
+    memcpy(result, clipdata.data(), sz);
     result[sz] = '\0';
     if (len) *len = static_cast<int>(sz);
     return result;
 }
+
+/*=============================================================================
+ * Graphics protocol detection
+ *
+ * Detection is performed in scintilla_notcurses_init() in three stages:
+ *
+ *  Stage 1 – env-var heuristics (cheap, before notcurses_init):
+ *    $TERM_PROGRAM  kitty / WezTerm / ghostty / iTerm.app  → KITTY
+ *    $TERM          xterm-kitty / xterm-ghostty             → KITTY
+ *                   mlterm / foot / yaft / *sixel*          → SIXEL
+ *
+ *  Stage 2 – notcurses runtime query (after notcurses_init):
+ *    notcurses_check_pixel_support() returns an ncpixelimpl_e value that
+ *    is mapped to KITTY / SIXEL / NONE.  This overrides stage 1 only when
+ *    stage 1 returned NONE (i.e. env vars gave no hint).
+ *
+ *  Stage 3 – user override:
+ *    scinterm_set_graphics_protocol() stores a value in g_graphics_request.
+ *    Any value other than AUTO short-circuits both stages above.
+ *
+ * The resolved protocol is stored in g_graphics_active after init.
+ *===========================================================================*/
+
+/** Protocol requested by the caller (default: auto-detect). */
+static ScintermGraphicsProtocol g_graphics_request = SCINTERM_GRAPHICS_AUTO;
+
+/** Protocol actually in use after init (resolved from request + detection). */
+static ScintermGraphicsProtocol g_graphics_active  = SCINTERM_GRAPHICS_NONE;
+
+/** Whether init has been called (locks graphics_request). */
+static std::atomic<bool> g_init_completed{false};
+
+/**
+ * Stage 1: probe $TERM_PROGRAM and $TERM for well-known pixel-capable
+ * terminals.  Returns KITTY, SIXEL, or NONE.  Never returns AUTO.
+ */
+static ScintermGraphicsProtocol detect_graphics_from_env() noexcept {
+    /* $TERM_PROGRAM takes priority — it is set by the terminal emulator itself
+     * and is more reliable than $TERM which can be overridden by the user. */
+    const char *tp = std::getenv("TERM_PROGRAM");
+    if (tp) {
+        if (std::strcmp(tp, "kitty")    == 0) return SCINTERM_GRAPHICS_KITTY;
+        if (std::strcmp(tp, "WezTerm")  == 0) return SCINTERM_GRAPHICS_KITTY;
+        if (std::strcmp(tp, "ghostty")  == 0) return SCINTERM_GRAPHICS_KITTY;
+        if (std::strcmp(tp, "iTerm.app")== 0) return SCINTERM_GRAPHICS_KITTY;
+    }
+    /* $COLORTERM=truecolor/24bit is not graphics-specific; skip it. */
+
+    const char *term = std::getenv("TERM");
+    if (term) {
+        /* Kitty-family TERM strings */
+        if (std::strcmp(term, "xterm-kitty")   == 0) return SCINTERM_GRAPHICS_KITTY;
+        if (std::strcmp(term, "xterm-ghostty")  == 0) return SCINTERM_GRAPHICS_KITTY;
+        /* Sixel-capable terminals */
+        if (std::strcmp(term, "mlterm") == 0) return SCINTERM_GRAPHICS_SIXEL;
+        if (std::strcmp(term, "foot")   == 0) return SCINTERM_GRAPHICS_SIXEL;
+        if (std::strcmp(term, "yaft")   == 0) return SCINTERM_GRAPHICS_SIXEL;
+        /* Generic sixel marker anywhere in $TERM (e.g. "xterm+sixel") */
+        if (std::strstr(term, "sixel") != nullptr) return SCINTERM_GRAPHICS_SIXEL;
+    }
+    return SCINTERM_GRAPHICS_NONE;
+}
+
+/**
+ * Stage 2: map a notcurses ncpixelimpl_e value to our enum.
+ * NCPIXEL_NONE / unknown → NONE; kitty variants → KITTY; sixel → SIXEL.
+ */
+static ScintermGraphicsProtocol ncpixel_to_protocol(ncpixelimpl_e impl) noexcept {
+    switch (impl) {
+        case NCPIXEL_KITTY_STATIC:
+        case NCPIXEL_KITTY_ANIMATED:
+        case NCPIXEL_KITTY_SELFREF:
+            return SCINTERM_GRAPHICS_KITTY;
+        case NCPIXEL_SIXEL:
+            return SCINTERM_GRAPHICS_SIXEL;
+        default:
+            return SCINTERM_GRAPHICS_NONE;
+    }
+}
+
+/**
+ * Translate a resolved protocol to the NCOPTION_* flags that should be
+ * OR-ed into notcurses_init().
+ *
+ * NCOPTION_NO_CLEAR_BITMAPS tells NotCurses not to erase pixel-graphics
+ * content (kitty/sixel images) when it refreshes planes.  This preserves
+ * inline images already present on screen before the editor was launched.
+ */
+static uint64_t graphics_to_ncoption_flags(ScintermGraphicsProtocol proto) noexcept {
+    switch (proto) {
+        case SCINTERM_GRAPHICS_KITTY:
+        case SCINTERM_GRAPHICS_SIXEL:
+            return NCOPTION_NO_CLEAR_BITMAPS;
+        default:
+            return 0;
+    }
+}
+
+#ifdef SCINTERM_DEBUG
+/** Return a human-readable name for a protocol value (debug builds only). */
+static const char *protocol_name(ScintermGraphicsProtocol proto) noexcept {
+    switch (proto) {
+        case SCINTERM_GRAPHICS_AUTO:  return "AUTO";
+        case SCINTERM_GRAPHICS_KITTY: return "KITTY";
+        case SCINTERM_GRAPHICS_SIXEL: return "SIXEL";
+        case SCINTERM_GRAPHICS_NONE:  return "NONE";
+        default:                      return "UNKNOWN";
+    }
+}
+#endif /* SCINTERM_DEBUG */
 
 /*=============================================================================
  * C API implementation
@@ -529,74 +878,136 @@ char *ScintillaNotCurses::GetClipboard(int *len) {
 extern "C" {
 
 bool scintilla_notcurses_init(void) {
-    return Scintilla::Internal::InitNotCurses();
+    using namespace Scintilla::Internal;
+    
+    if (g_init_completed.load()) {
+        // Already initialized
+        return true;
+    }
+
+    /* --- Stage 3: if caller already overrode, skip env detection --- */
+    ScintermGraphicsProtocol detected;
+    if (g_graphics_request != SCINTERM_GRAPHICS_AUTO) {
+        detected = g_graphics_request;
+#ifdef SCINTERM_DEBUG
+        std::fprintf(stderr, "[scinterm] graphics override: %s\n",
+                     protocol_name(detected));
+#endif
+    } else {
+        /* --- Stage 1: cheap env-var heuristics --- */
+        detected = detect_graphics_from_env();
+#ifdef SCINTERM_DEBUG
+        std::fprintf(stderr, "[scinterm] graphics env detection: %s\n",
+                     protocol_name(detected));
+#endif
+    }
+
+    /* Compute NCOPTION flags from what we know before init.
+     * When AUTO/NONE from env, we pass 0 now and refine after init via
+     * notcurses_check_pixel_support(). */
+    const uint64_t extra_flags = (detected != SCINTERM_GRAPHICS_NONE)
+                                 ? graphics_to_ncoption_flags(detected)
+                                 : 0;
+
+    if (!InitNotCurses(extra_flags))
+        return false;
+
+    /* --- Stage 2: runtime pixel-support query (only if not user-overridden
+     *              and env gave no hint) --- */
+    if (g_graphics_request == SCINTERM_GRAPHICS_AUTO
+        && detected == SCINTERM_GRAPHICS_NONE) {
+        const ncpixelimpl_e impl = notcurses_check_pixel_support(GetNotCurses());
+        detected = ncpixel_to_protocol(impl);
+#ifdef SCINTERM_DEBUG
+        std::fprintf(stderr, "[scinterm] graphics notcurses query: impl=%d → %s\n",
+                     static_cast<int>(impl), protocol_name(detected));
+#endif
+    }
+
+    g_graphics_active = detected;
+    g_init_completed.store(true);
+
+#ifdef SCINTERM_DEBUG
+    std::fprintf(stderr, "[scinterm] graphics active: %s\n",
+                 protocol_name(g_graphics_active));
+#endif
+    return true;
+}
+
+void scinterm_set_graphics_protocol(ScintermGraphicsProtocol protocol) {
+    if (!g_init_completed.load()) {
+        g_graphics_request = protocol;
+    }
+    // Silently ignore if init already completed - protocol is locked
 }
 
 void scintilla_notcurses_shutdown(void) {
     Scintilla::Internal::ShutdownNotCurses();
+    g_init_completed.store(false);
 }
 
-void *scintilla_new(void (*cb)(void *, int, SCNotification *, void *), void *ud) {
-    auto *sci = new(std::nothrow) ScintillaNotCurses(cb, ud);
-    return sci;
+ScintillaHandle *scintilla_new(ScintillaCallback cb, void *ud) {
+    auto *sci = new(std::nothrow) ScintillaNotCurses(
+        reinterpret_cast<void (*)(void *, int, SCNotification *, void *)>(cb), ud);
+    return reinterpret_cast<ScintillaHandle *>(sci);
 }
 
-void scintilla_delete(void *sci) {
-    delete static_cast<ScintillaNotCurses *>(sci);
+void scintilla_delete(ScintillaHandle *sci) {
+    delete reinterpret_cast<ScintillaNotCurses *>(sci);
 }
 
-struct ncplane *scintilla_get_plane(void *sci) {
+struct ncplane *scintilla_get_plane(ScintillaHandle *sci) {
     if (!sci) return nullptr;
-    return static_cast<ScintillaNotCurses *>(sci)->GetPlane();
+    return reinterpret_cast<ScintillaNotCurses *>(sci)->GetPlane();
 }
 
-sptr_t scintilla_send_message(void *sci, unsigned int iMessage, uptr_t wParam, sptr_t lParam) {
+sptr_t scintilla_send_message(ScintillaHandle *sci, unsigned int iMessage, uptr_t wParam, sptr_t lParam) {
     if (!sci) return 0;
-    return static_cast<ScintillaNotCurses *>(sci)->WndProc(
+    return reinterpret_cast<ScintillaNotCurses *>(sci)->WndProc(
         static_cast<Scintilla::Message>(iMessage), wParam, lParam);
 }
 
-void scintilla_send_key(void *sci, int key, int modifiers) {
+void scintilla_send_key(ScintillaHandle *sci, int key, int modifiers) {
     if (!sci) return;
-    static_cast<ScintillaNotCurses *>(sci)->SendKey(key, modifiers);
+    reinterpret_cast<ScintillaNotCurses *>(sci)->SendKey(key, modifiers);
 }
 
-bool scintilla_send_mouse(void *sci, int event, int button, int modifiers, int y, int x) {
+bool scintilla_send_mouse(ScintillaHandle *sci, int event, int button, int modifiers, int y, int x) {
     if (!sci) return false;
-    return static_cast<ScintillaNotCurses *>(sci)->SendMouse(event, button, modifiers, y, x);
+    return reinterpret_cast<ScintillaNotCurses *>(sci)->SendMouse(event, button, modifiers, y, x);
 }
 
-bool scintilla_process_input(void *sci, struct notcurses *nc) {
+bool scintilla_process_input(ScintillaHandle *sci, struct notcurses *nc) {
     if (!sci || !nc) return false;
-    return static_cast<ScintillaNotCurses *>(sci)->ProcessInput(nc);
+    return reinterpret_cast<ScintillaNotCurses *>(sci)->ProcessInput(nc);
 }
 
-void scintilla_render(void *sci) {
+void scintilla_render(ScintillaHandle *sci) {
     if (!sci) return;
-    static_cast<ScintillaNotCurses *>(sci)->Render();
+    reinterpret_cast<ScintillaNotCurses *>(sci)->Render();
 }
 
-void scintilla_update_cursor(void *sci) {
+void scintilla_update_cursor(ScintillaHandle *sci) {
     if (!sci) return;
-    static_cast<ScintillaNotCurses *>(sci)->UpdateCursor();
+    reinterpret_cast<ScintillaNotCurses *>(sci)->UpdateCursor();
 }
 
-void scintilla_resize(void *sci) {
+void scintilla_resize(ScintillaHandle *sci) {
     if (!sci) return;
-    static_cast<ScintillaNotCurses *>(sci)->Resize();
+    reinterpret_cast<ScintillaNotCurses *>(sci)->Resize();
 }
 
-void scintilla_set_focus(void *sci, bool focus) {
+void scintilla_set_focus(ScintillaHandle *sci, bool focus) {
     if (!sci) return;
-    static_cast<ScintillaNotCurses *>(sci)->SetFocus(focus);
+    reinterpret_cast<ScintillaNotCurses *>(sci)->SetFocus(focus);
 }
 
-char *scintilla_get_clipboard(void *sci, int *len) {
+char *scintilla_get_clipboard(ScintillaHandle *sci, int *len) {
     if (!sci) {
         if (len) *len = 0;
         return nullptr;
     }
-    return static_cast<ScintillaNotCurses *>(sci)->GetClipboard(len);
+    return reinterpret_cast<ScintillaNotCurses *>(sci)->GetClipboard(len);
 }
 
 void scintilla_set_color_offsets(int color_offset, int pair_offset) {
@@ -605,11 +1016,7 @@ void scintilla_set_color_offsets(int color_offset, int pair_offset) {
     /* No-op: NotCurses uses direct true color */
 }
 
-void scintilla_set_bg_alpha(int pct) {
-    SetBgAlpha(pct);
-}
-
-bool scintilla_set_lexer(void *sci, const char *name, const char *lexers_dir) {
+bool scintilla_set_lexer(ScintillaHandle *sci, const char *name, const char *lexers_dir) {
 #ifdef ENABLE_SCINTILLUA
     if (!sci || !name) return false;
     if (lexers_dir)

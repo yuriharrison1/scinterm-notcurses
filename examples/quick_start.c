@@ -9,7 +9,7 @@
 #include <stdbool.h>
 
 /* Notification callback */
-static void callback(void *sci, int iMessage, SCNotification *n, void *userdata) {
+static void callback(ScintillaHandle *sci, int iMessage, SCNotification *n, void *userdata) {
     (void)sci; (void)iMessage; (void)n; (void)userdata;
     /* Handle Scintilla notifications */
 }
@@ -19,7 +19,7 @@ int main(void) {
     if (!scintilla_notcurses_init()) return 1;
 
     /* Create editor */
-    void *editor = scintilla_new(callback, NULL);
+    ScintillaHandle *editor = scintilla_new(callback, NULL);
     if (!editor) {
         scintilla_notcurses_shutdown();
         return 1;
@@ -44,6 +44,9 @@ int main(void) {
         ncinput input = {};
         uint32_t key = notcurses_get_blocking(nc, &input);
         if (key == (uint32_t)-1) break;
+
+        /* Skip key release events (Kitty protocol sends press+release pairs) */
+        if (input.evtype == NCTYPE_RELEASE) continue;
 
         if (key == NCKEY_ESC) {
             running = false;
