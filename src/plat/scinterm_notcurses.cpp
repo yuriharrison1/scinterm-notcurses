@@ -188,7 +188,8 @@ static void DrawFoldMarkerCallback(Surface *surface, const PRectangle &rcWhole,
 
 class ScintillaNotCurses : public ScintillaBase {
     struct ncplane *ncp;
-    bool hasFocus;
+    /* Note: hasFocus is inherited from EditModel (via Editor -> ScintillaBase)
+     * Use the inherited variable to avoid state divergence */
     bool capturedMouse;
     /* Dirty flag: true when the plane needs a Scintilla repaint.
      * Starts true so the very first Render() always paints.
@@ -289,7 +290,7 @@ public:
 
 ScintillaNotCurses::ScintillaNotCurses(void (*cb)(void *, int, SCNotification *, void *),
                                        void *ud)
-    : ncp(nullptr), hasFocus(false), capturedMouse(false), dirty(true),
+    : ncp(nullptr), capturedMouse(false), dirty(true),
       lastRenderTime{}, notifyCallback(cb), notifyUserdata(ud) {
     lastRenderTime.tv_sec = 0;
     lastRenderTime.tv_nsec = 0;
@@ -414,7 +415,9 @@ void ScintillaNotCurses::Copy() {
 
 void ScintillaNotCurses::Paste() {
     if (g_clipboard.empty()) return;
+    if (!pdoc) return;
     std::string clipdata = g_clipboard.get();
+    if (clipdata.empty()) return;
     ClearSelection(false);
     InsertPaste(clipdata.c_str(), static_cast<Sci::Position>(clipdata.size()));
 }
@@ -499,7 +502,7 @@ void ScintillaNotCurses::Resize() {
 }
 
 void ScintillaNotCurses::SetFocus(bool focus) {
-    hasFocus = focus;
+    /* Note: SetFocusState updates the inherited hasFocus from EditModel */
     SetFocusState(focus);
     scinterm_mark_dirty();   /* focus change affects cursor visibility */
 }
@@ -1014,6 +1017,10 @@ void scintilla_set_color_offsets(int color_offset, int pair_offset) {
     (void)color_offset;
     (void)pair_offset;
     /* No-op: NotCurses uses direct true color */
+}
+
+void scintilla_set_bg_alpha(int pct) {
+    SetBgAlpha(pct);
 }
 
 bool scintilla_set_lexer(ScintillaHandle *sci, const char *name, const char *lexers_dir) {
