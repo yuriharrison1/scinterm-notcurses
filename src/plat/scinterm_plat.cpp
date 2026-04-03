@@ -15,6 +15,8 @@
 #include <cstdarg>
 #include <cmath>
 #include <climits>
+#include <unistd.h>  // for isatty()
+#include <signal.h>  // for alarm()
 
 #include <stdexcept>
 #include <string>
@@ -112,17 +114,45 @@ static inline void *arena_alloc_safe(Arena *a, size_t size) {
 }
 
 bool InitNotCurses(uint64_t extra_ncopts) {
+    // Check if we're in a valid terminal environment
+    const char* force_env = getenv("LIMOON_FORCE");
+    if (!force_env || strcmp(force_env, "1") != 0) {
+        if (!isatty(STDIN_FILENO) && !isatty(STDOUT_FILENO)) {
+            fprintf(stderr, "Error: not running in a terminal (stdin/stdout not a TTY)\n");
+            return false;
+        }
+    }
+    
     struct notcurses_options opts = {};
-    opts.flags = NCOPTION_SUPPRESS_BANNERS | extra_ncopts;
+    // Add NO_QUIT_SIGHANDLERS to avoid signal handling conflicts
+    opts.flags = NCOPTION_SUPPRESS_BANNERS | NCOPTION_NO_QUIT_SIGHANDLERS | extra_ncopts;
+    
+    // Set a timeout to prevent hanging on terminal detection
+    // This is especially important for CI/test environments
+    const char* timeout_env = getenv("NOTCURSES_TIMEOUT");
+    int timeout_sec = timeout_env ? atoi(timeout_env) : 3; // Default 3 seconds
+    if (timeout_sec > 0) {
+        alarm(timeout_sec);
+    }
     g_nc = notcurses_init(&opts, nullptr);
-    if (!g_nc) return false;
+    
+    // Cancel the alarm if notcurses_init returned
+    alarm(0);
+    
+    if (!g_nc) {
+        fprintf(stderr, "Error: notcurses_init() failed - could not initialize terminal\n");
+        fprintf(stderr, "Check that your terminal supports the required features.\n");
+        return false;
+    }
     g_stdplane = notcurses_stdplane(g_nc);
     if (!g_stdplane) {
+        fprintf(stderr, "Error: could not get notcurses standard plane\n");
         notcurses_stop(g_nc);
         g_nc = nullptr;
         return false;
     }
     if (!arena_init(&g_render_arena, SCINTERM_ARENA_SIZE)) {
+        fprintf(stderr, "Error: could not initialize render arena (out of memory?)\n");
         notcurses_stop(g_nc);
         g_nc = nullptr;
         g_stdplane = nullptr;
